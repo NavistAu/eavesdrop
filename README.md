@@ -24,9 +24,12 @@ so an interleaved feed stays readable when several are running at once.
 ## Install
 
 ```sh
-cargo build --release
-cp target/release/eavesdrop ~/.local/bin/
+mise run release
 ```
+
+Builds in release mode and installs the binary to `~/.local/bin/eavesdrop`.
+The install is a mise task rather than part of the build because cargo has no
+post-build hook — `build.rs` runs before the binary is linked.
 
 Needs Rust 1.95 (`mise install` picks it up from `mise.toml`).
 

@@ -1,2 +1,20 @@
 [tools]
 rust = "1.95"
+
+# `cargo build --release` cannot do the install itself: build.rs runs before
+# the binary is linked, and cargo has no post-build hook. So the release build
+# is wrapped instead of extended.
+#
+# `install` rather than `cp` because it sets the mode in the same step, and
+# because it writes a temp file and renames it over the target. That matters on
+# Linux, where overwriting a running binary in place fails with ETXTBSY —
+# plausible here, since the target is on $PATH and eavesdrop is often left
+# following. macOS permits the in-place overwrite, so `cp` would work there.
+[tasks.release]
+description = "Release build, then install the binary to ~/.local/bin"
+run = [
+  "cargo build --release",
+  "mkdir -p \"$HOME/.local/bin\"",
+  "install -m 755 target/release/eavesdrop \"$HOME/.local/bin/eavesdrop\"",
+  "echo \"installed $(\"$HOME/.local/bin/eavesdrop\" --version) to $HOME/.local/bin\"",
+]
