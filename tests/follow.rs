@@ -14,7 +14,7 @@ use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_eavesdrop");
 /// Generous: the follow loop polls at 400 ms, rediscovers at 2 s, and holds
-/// each message for a 750 ms grace before printing.
+/// each message for a 2.5 s grace before printing.
 const WAIT: Duration = Duration::from_secs(12);
 
 struct Fixture {
@@ -162,19 +162,28 @@ fn a_live_exchange_written_to_two_files_prints_as_one_row() {
             "toolu_1",
             "aaaa1111",
             "worker-two",
+            "unrendered-summary",
             "Rerun the suite",
-            "rerun it",
         ),
     );
     fixture.append("a", &send_ok("toolu_1"));
     std::thread::sleep(Duration::from_millis(300));
     fixture.append(
         "b",
-        &enqueue(&ts, "bbbb2222", "Supervisor doing the rounds", "rerun it"),
+        &enqueue(
+            &ts,
+            "bbbb2222",
+            "Supervisor doing the rounds",
+            "Rerun the suite",
+        ),
     );
 
     let line = follower.next_line().expect("a message should be printed");
     assert!(line.contains("Rerun the suite"), "{line}");
+    // The sender's summary must never reach the column: only the sending side
+    // records one, so using it would make the text mean different things
+    // depending on which transcript happened to be scanned.
+    assert!(!line.contains("unrendered-summary"), "{line}");
     // Both ends named, and no caveat: the two halves were folded into one row.
     assert!(
         line.contains("Worker two"),
@@ -198,7 +207,14 @@ fn a_history_only_run_reads_what_is_already_on_disk() {
     let ts = now();
     fixture.append(
         "a",
-        &send_use(&ts, "toolu_1", "aaaa1111", "peer", "Landed it", "body"),
+        &send_use(
+            &ts,
+            "toolu_1",
+            "aaaa1111",
+            "peer",
+            "unrendered-summary",
+            "Landed it",
+        ),
     );
     fixture.append("a", &send_ok("toolu_1"));
 
@@ -207,6 +223,7 @@ fn a_history_only_run_reads_what_is_already_on_disk() {
     assert!(out.status.success());
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     assert!(stdout.contains("Landed it"), "{stdout}");
+    assert!(!stdout.contains("unrendered-summary"), "{stdout}");
     assert!(
         stdout.contains("(sent; recipient transcript not in window)"),
         "{stdout}"
@@ -220,13 +237,13 @@ fn the_since_window_excludes_older_messages() {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     fixture.append(
         "a",
-        &send_use(&old, "toolu_1", "aaaa1111", "peer", "Ancient", "body"),
+        &send_use(&old, "toolu_1", "aaaa1111", "peer", "s-old", "Ancient"),
     );
     fixture.append("a", &send_ok("toolu_1"));
     let recent = now();
     fixture.append(
         "a",
-        &send_use(&recent, "toolu_2", "aaaa1111", "peer", "Recent", "body2"),
+        &send_use(&recent, "toolu_2", "aaaa1111", "peer", "s-new", "Recent"),
     );
     fixture.append("a", &send_ok("toolu_2"));
 
@@ -249,8 +266,8 @@ fn tail_keeps_only_the_most_recent_rows() {
                 &id,
                 "aaaa1111",
                 "peer",
+                &format!("s{i}"),
                 &format!("msg{i}"),
-                &format!("body{i}"),
             ),
         );
         fixture.append("a", &send_ok(&id));
@@ -374,7 +391,7 @@ fn a_transcript_that_only_starts_moving_mid_run_is_picked_up() {
     let ts = now();
     fixture.append(
         "late",
-        &send_use(&ts, "toolu_9", "cccc3333", "peer", "From nowhere", "b"),
+        &send_use(&ts, "toolu_9", "cccc3333", "peer", "s", "From nowhere"),
     );
     fixture.append("late", &send_ok("toolu_9"));
 

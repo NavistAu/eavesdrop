@@ -43,7 +43,7 @@ it, then follows live.
 | `--pane` | Only agents running in panes of the current tmux window |
 | `--since 30m` | How much history to read first (`90s`, `30m`, `24h`, `7d`) |
 | `--tail N` | Show at most N historical messages |
-| `--full` | Print whole message bodies, not just the summary line |
+| `--full` | Print whole message bodies, not just the first line |
 | `--no-follow` | Print history and exit |
 | `--json` | One JSON object per message, for piping |
 
@@ -94,6 +94,13 @@ JSON parser. A 7-day window over 678 files runs in 0.8 s.
   older group's colour survives and the new rows join it. Rows already on
   screen are never retroactively wrong, but the merged group's earlier rows
   keep their original colour.
+- **A row shows the message's first line, never the sender's `summary`.** A
+  summary reads like the better label, but only the *sending* side records one,
+  so preferring it made the column mean "summary" or "first line" depending on
+  which transcript happened to be scanned. The body is the one thing both sides
+  record identically. A trailing `…` marks a line that is an extract, so it is
+  never mistaken for a message truncated in transit. `--json` still carries
+  `summary`, where it is labelled.
 - **A late second half is dropped, not re-rendered.** While following, the two
   records reach disk hundreds of milliseconds apart — the recipient's enqueue
   is written immediately, the sender's only once its tool_result lands. Rows

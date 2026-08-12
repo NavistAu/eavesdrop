@@ -159,13 +159,27 @@ pub fn line(feed: &Feed, groups: &mut Groups, message: &Message, style: Style) -
     );
     let arrow = paint(style, colour, false, "\u{2192}");
 
-    let text = message
-        .summary
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| message.first_line());
+    // The first line of the message itself, never the sender's `summary`.
+    //
+    // A summary reads like the better label, but it is written only on the
+    // sending side: a row seen only from the recipient's transcript has none.
+    // Preferring it made the column mean "summary" or "first line" depending on
+    // which transcript happened to fall inside the scan window — two rows that
+    // look alike carrying different kinds of text. The body is the one thing
+    // both sides record identically, so it is the only choice that renders the
+    // same regardless of what was observed. `--json` still carries `summary`,
+    // where it is labelled.
+    let text = message.first_line();
+    // Say so when the line is an extract. Without this a one-line view of a
+    // long message is indistinguishable from a message that was truncated in
+    // transit — which is exactly how it was first reported.
+    let more = if message.body.trim() == text.trim() {
+        ""
+    } else {
+        "\u{2026}"
+    };
 
-    let mut out = format!("{}  {from} {arrow} {to}  {text}", dim(style, &time));
+    let mut out = format!("{}  {from} {arrow} {to}  {text}{more}", dim(style, &time));
     if let Some(caveat) = caveat(message.corroboration()) {
         out.push_str(&format!("  {}", dim(style, caveat)));
     }
@@ -277,7 +291,7 @@ mod tests {
         let mut g = Groups::new();
         let out = line(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), plain());
         assert!(out.contains("\u{2192}"), "{out}");
-        assert!(out.ends_with("hi"), "{out}");
+        assert!(out.ends_with("hi there"), "{out}");
     }
 
     #[test]
@@ -291,15 +305,39 @@ mod tests {
     }
 
     #[test]
-    fn a_message_with_no_summary_falls_back_to_its_first_line() {
+    fn the_line_shows_the_body_never_the_senders_summary() {
+        // The summary is written only on the sending side, so preferring it
+        // made the column's meaning depend on which transcript was scanned.
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
-        m.summary = None;
+        m.summary = Some("A tidy summary".into());
+        m.body = "the actual first line".into();
+        let out = line(&feed, &mut g, &m, plain());
+        assert!(out.ends_with("the actual first line"), "{out}");
+        assert!(!out.contains("A tidy summary"), "{out}");
+    }
+
+    #[test]
+    fn a_multi_line_body_is_marked_as_an_extract() {
+        let feed = Feed::new(Registry::empty());
+        let mut g = Groups::new();
+        let mut m = msg("aaaa1111", "bbbb2222");
         m.body = "first line\nsecond line".into();
         let out = line(&feed, &mut g, &m, plain());
-        assert!(out.ends_with("first line"), "{out}");
+        // The ellipsis is what stops this reading as a truncated message.
+        assert!(out.ends_with("first line\u{2026}"), "{out}");
         assert!(!out.contains("second line"), "{out}");
+    }
+
+    #[test]
+    fn a_single_line_body_gets_no_ellipsis() {
+        let feed = Feed::new(Registry::empty());
+        let mut g = Groups::new();
+        let mut m = msg("aaaa1111", "bbbb2222");
+        m.body = "all of it".into();
+        let out = line(&feed, &mut g, &m, plain());
+        assert!(out.ends_with("all of it"), "{out}");
     }
 
     #[test]
