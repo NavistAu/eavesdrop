@@ -109,6 +109,18 @@ impl Follower {
     fn next_line(&self) -> Result<String, RecvTimeoutError> {
         self.lines.recv_timeout(WAIT)
     }
+
+    /// A header line plus `body_lines` following body lines, joined. The count
+    /// is passed in because a body ends only when the next message starts or
+    /// the feed goes quiet, which a reader cannot tell apart in time.
+    fn next_message(&self, body_lines: usize) -> Result<String, RecvTimeoutError> {
+        let mut out = self.next_line()?;
+        for _ in 0..body_lines {
+            out.push('\n');
+            out.push_str(&self.next_line()?);
+        }
+        Ok(out)
+    }
 }
 
 impl Drop for Follower {
@@ -116,6 +128,16 @@ impl Drop for Follower {
         self.child.kill().ok();
         self.child.wait().ok();
     }
+}
+
+/// Messages printed, counted by header lines. A message renders as one header
+/// at column 0 followed by its body indented, so counting raw lines counts
+/// paragraphs rather than messages.
+fn message_count(stdout: &str) -> usize {
+    stdout
+        .lines()
+        .filter(|l| !l.starts_with(' ') && !l.is_empty())
+        .count()
 }
 
 fn now() -> String {
@@ -178,7 +200,9 @@ fn a_live_exchange_written_to_two_files_prints_as_one_row() {
         ),
     );
 
-    let line = follower.next_line().expect("a message should be printed");
+    let line = follower
+        .next_message(1)
+        .expect("a message should be printed");
     assert!(line.contains("Rerun the suite"), "{line}");
     // The sender's summary must never reach the column: only the sending side
     // records one, so using it would make the text mean different things
@@ -221,7 +245,7 @@ fn a_history_only_run_reads_what_is_already_on_disk() {
     let out = fixture.run(&["--since", "1h", "--no-follow"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success());
-    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert_eq!(message_count(&stdout), 1, "{stdout}");
     assert!(stdout.contains("Landed it"), "{stdout}");
     assert!(!stdout.contains("unrendered-summary"), "{stdout}");
     assert!(
@@ -278,7 +302,7 @@ fn tail_keeps_only_the_most_recent_rows() {
             .stdout,
     )
     .unwrap();
-    assert_eq!(stdout.lines().count(), 2, "{stdout}");
+    assert_eq!(message_count(&stdout), 2, "{stdout}");
     assert!(
         stdout.contains("msg2") && stdout.contains("msg3"),
         "{stdout}"
@@ -299,7 +323,11 @@ fn json_output_is_one_object_per_message() {
 
     let out = fixture.run(&["--since", "1h", "--no-follow", "--json"]);
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "one JSON object per line: {stdout}"
+    );
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(value["from_session"], "aaaa1111");
     assert_eq!(value["to_session"], "bbbb2222");
@@ -310,21 +338,32 @@ fn json_output_is_one_object_per_message() {
 }
 
 #[test]
-fn full_prints_the_body_under_the_row() {
-    let fixture = Fixture::new("full");
+fn the_whole_body_prints_with_no_flag_to_ask_for_it() {
+    let fixture = Fixture::new("body");
     let ts = now();
     fixture.append(
         "a",
-        &send_use(&ts, "toolu_1", "aaaa1111", "peer", "Sum", "line one"),
+        &send_use(
+            &ts,
+            "toolu_1",
+            "aaaa1111",
+            "peer",
+            "Sum",
+            "line one\\nline two\\nline three",
+        ),
     );
     fixture.append("a", &send_ok("toolu_1"));
-    let stdout = String::from_utf8(
-        fixture
-            .run(&["--since", "1h", "--no-follow", "--full"])
-            .stdout,
-    )
-    .unwrap();
-    assert!(stdout.contains("\n        line one"), "{stdout:?}");
+    let stdout = String::from_utf8(fixture.run(&["--since", "1h", "--no-follow"]).stdout).unwrap();
+    assert!(
+        stdout.contains("\n        line one\n        line two\n        line three"),
+        "{stdout:?}"
+    );
+    // The header names both ends; the body carries the words. Nothing elided.
+    assert!(!stdout.contains('\u{2026}'), "{stdout:?}");
+    assert!(
+        !stdout.contains("Sum"),
+        "summary must not appear: {stdout:?}"
+    );
 }
 
 #[test]
@@ -396,7 +435,7 @@ fn a_transcript_that_only_starts_moving_mid_run_is_picked_up() {
     fixture.append("late", &send_ok("toolu_9"));
 
     let line = follower
-        .next_line()
+        .next_message(1)
         .expect("rediscovery should find the new file");
     assert!(line.contains("From nowhere"), "{line}");
 }

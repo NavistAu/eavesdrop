@@ -18,7 +18,7 @@ use clap::Parser;
 use extract::{Observation, Scanner};
 use feed::Feed;
 use registry::Registry;
-use render::{Groups, Style};
+use render::Groups;
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -65,10 +65,6 @@ struct Cli {
     /// Show at most this many historical messages
     #[arg(long, value_name = "N")]
     tail: Option<usize>,
-
-    /// Print full message bodies, not just the summary line
-    #[arg(long)]
-    full: bool,
 
     /// Print history and exit instead of following
     #[arg(long)]
@@ -135,12 +131,8 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     feed.ingest(std::mem::take(&mut observations));
 
-    let style = Style {
-        colour: !cli.json
-            && std::io::stdout().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none(),
-        full: cli.full,
-    };
+    let colour_on =
+        !cli.json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut groups = Groups::new();
     let mut printed: HashSet<String> = HashSet::new();
     let stdout = std::io::stdout();
@@ -175,7 +167,7 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     for message in &history {
         printed.insert(message.key());
-        if emit(&mut out, &feed, &mut groups, message, style, cli.json).is_err() {
+        if emit(&mut out, &feed, &mut groups, message, colour_on, cli.json).is_err() {
             return Ok(());
         }
     }
@@ -229,7 +221,7 @@ fn run(cli: Cli) -> Result<(), String> {
             if !passes(&feed, &message, filter.as_ref()) {
                 continue;
             }
-            if emit(&mut out, &feed, &mut groups, &message, style, cli.json).is_err() {
+            if emit(&mut out, &feed, &mut groups, &message, colour_on, cli.json).is_err() {
                 return Ok(());
             }
             wrote = true;
@@ -254,13 +246,13 @@ fn emit(
     feed: &Feed,
     groups: &mut Groups,
     message: &feed::Message,
-    style: Style,
+    colour_on: bool,
     as_json: bool,
 ) -> std::io::Result<()> {
     let text = if as_json {
         render::json(feed, message)
     } else {
-        render::line(feed, groups, message, style)
+        render::render(feed, groups, message, colour_on)
     };
     writeln!(out, "{text}")
 }

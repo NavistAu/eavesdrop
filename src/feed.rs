@@ -67,14 +67,6 @@ impl Message {
     pub fn key(&self) -> String {
         format!("{}\u{1}{}", self.ts.timestamp_millis(), self.body)
     }
-
-    /// First non-empty line of the body, for the one-line form.
-    pub fn first_line(&self) -> &str {
-        self.body
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-    }
 }
 
 /// Accumulates observations, pairs the two sides of each exchange, and
@@ -627,16 +619,6 @@ mod tests {
         let got = drain(&mut f);
         assert_eq!(got[0].body, "first");
         assert_eq!(got[1].body, "second");
-    }
-
-    #[test]
-    fn first_line_skips_leading_blank_lines() {
-        let mut f = feed();
-        f.ingest(vec![sent(
-            "2026-08-10T20:00:00.000Z",
-            "\n\n  real line\nmore",
-        )]);
-        assert_eq!(drain(&mut f)[0].first_line(), "  real line");
     }
 
     #[test]

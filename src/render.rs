@@ -88,23 +88,16 @@ impl Groups {
     }
 }
 
-/// Whether to emit ANSI escapes at all.
-#[derive(Clone, Copy)]
-pub struct Style {
-    pub colour: bool,
-    pub full: bool,
-}
-
-fn paint(style: Style, code: u8, bold: bool, text: &str) -> String {
-    if !style.colour {
+fn paint(colour_on: bool, code: u8, bold: bool, text: &str) -> String {
+    if !colour_on {
         return text.to_string();
     }
     let weight = if bold { ";1" } else { "" };
     format!("\u{1b}[38;5;{code}{weight}m{text}\u{1b}[0m")
 }
 
-fn dim(style: Style, text: &str) -> String {
-    if !style.colour {
+fn dim(colour_on: bool, text: &str) -> String {
+    if !colour_on {
         return text.to_string();
     }
     format!("\u{1b}[2m{text}\u{1b}[0m")
@@ -136,7 +129,15 @@ fn caveat(corroboration: Corroboration) -> Option<&'static str> {
     }
 }
 
-pub fn line(feed: &Feed, groups: &mut Groups, message: &Message, style: Style) -> String {
+/// A message as a header line naming both ends, then the message itself.
+///
+/// The body always prints in full. This is a log of what agents said to each
+/// other, so the words are the content and everything else is addressing; a
+/// one-line extract turns the feed into an index of a conversation you then
+/// cannot read. The sender's `summary` is never shown — only the sending side
+/// records one, so it would make the text mean different things depending on
+/// which transcript fell inside the scan window. `--json` still carries it.
+pub fn render(feed: &Feed, groups: &mut Groups, message: &Message, colour_on: bool) -> String {
     let (from_key, to_key) = feed.endpoints(message);
     let colour = groups.colour_of(&from_key, &to_key);
 
@@ -146,48 +147,36 @@ pub fn line(feed: &Feed, groups: &mut Groups, message: &Message, style: Style) -
         .format("%H:%M:%S")
         .to_string();
     let from = paint(
-        style,
+        colour_on,
         colour,
         true,
         &cell(&feed.sender_label(message), true),
     );
+    // The recipient is padded to the column only when a caveat follows it.
+    // Otherwise it ends the header, and padding would leave trailing spaces
+    // inside the colour escape where no trim can reach them.
+    let caveat = caveat(message.corroboration());
+    let recipient = feed.recipient_label(message);
     let to = paint(
-        style,
+        colour_on,
         colour,
         false,
-        &cell(&feed.recipient_label(message), false),
+        &match caveat {
+            Some(_) => cell(&recipient, false),
+            None => recipient,
+        },
     );
-    let arrow = paint(style, colour, false, "\u{2192}");
+    let arrow = paint(colour_on, colour, false, "\u{2192}");
 
-    // The first line of the message itself, never the sender's `summary`.
-    //
-    // A summary reads like the better label, but it is written only on the
-    // sending side: a row seen only from the recipient's transcript has none.
-    // Preferring it made the column mean "summary" or "first line" depending on
-    // which transcript happened to fall inside the scan window — two rows that
-    // look alike carrying different kinds of text. The body is the one thing
-    // both sides record identically, so it is the only choice that renders the
-    // same regardless of what was observed. `--json` still carries `summary`,
-    // where it is labelled.
-    let text = message.first_line();
-    // Say so when the line is an extract. Without this a one-line view of a
-    // long message is indistinguishable from a message that was truncated in
-    // transit — which is exactly how it was first reported.
-    let more = if message.body.trim() == text.trim() {
-        ""
-    } else {
-        "\u{2026}"
-    };
-
-    let mut out = format!("{}  {from} {arrow} {to}  {text}{more}", dim(style, &time));
-    if let Some(caveat) = caveat(message.corroboration()) {
-        out.push_str(&format!("  {}", dim(style, caveat)));
+    let mut out = format!("{}  {from} {arrow} {to}", dim(colour_on, &time));
+    if let Some(caveat) = caveat {
+        out.push_str(&format!("  {}", dim(colour_on, caveat)));
     }
-    if style.full {
-        for body_line in message.body.lines() {
-            out.push('\n');
-            out.push_str(&dim(style, &format!("        {body_line}")));
-        }
+    // Body at full weight, not dimmed: it is the thing being read, and the
+    // indent alone is enough to hold it apart from the header above it.
+    for body_line in message.body.lines() {
+        out.push('\n');
+        out.push_str(&format!("        {body_line}"));
     }
     out
 }
@@ -219,13 +208,6 @@ mod tests {
     use crate::extract::{Observation, Sent};
     use crate::feed::parse_ts;
     use crate::registry::Registry;
-
-    fn plain() -> Style {
-        Style {
-            colour: false,
-            full: false,
-        }
-    }
 
     fn msg(from: &str, to: &str) -> Message {
         Message {
@@ -289,7 +271,7 @@ mod tests {
     fn a_corroborated_line_carries_no_caveat() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
-        let out = line(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), plain());
+        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), false);
         assert!(out.contains("\u{2192}"), "{out}");
         assert!(out.ends_with("hi there"), "{out}");
     }
@@ -300,57 +282,59 @@ mod tests {
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
         m.recv_seen = false;
-        let out = line(&feed, &mut g, &m, plain());
+        let out = render(&feed, &mut g, &m, false);
         assert!(out.contains("recipient transcript not in window"), "{out}");
     }
 
     #[test]
-    fn the_line_shows_the_body_never_the_senders_summary() {
-        // The summary is written only on the sending side, so preferring it
-        // made the column's meaning depend on which transcript was scanned.
+    fn the_body_is_shown_never_the_senders_summary() {
+        // Only the sending side records a summary, so showing it would make
+        // the text depend on which transcript happened to be scanned.
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
         m.summary = Some("A tidy summary".into());
-        m.body = "the actual first line".into();
-        let out = line(&feed, &mut g, &m, plain());
-        assert!(out.ends_with("the actual first line"), "{out}");
+        m.body = "what was actually said".into();
+        let out = render(&feed, &mut g, &m, false);
+        assert!(out.ends_with("what was actually said"), "{out}");
         assert!(!out.contains("A tidy summary"), "{out}");
     }
 
     #[test]
-    fn a_multi_line_body_is_marked_as_an_extract() {
+    fn a_long_body_prints_whole_never_an_extract() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
-        m.body = "first line\nsecond line".into();
-        let out = line(&feed, &mut g, &m, plain());
-        // The ellipsis is what stops this reading as a truncated message.
-        assert!(out.ends_with("first line\u{2026}"), "{out}");
-        assert!(!out.contains("second line"), "{out}");
+        m.body = "first line\n\nmiddle line\nlast line".into();
+        let out = render(&feed, &mut g, &m, false);
+        for expected in ["first line", "middle line", "last line"] {
+            assert!(out.contains(expected), "missing {expected:?}: {out}");
+        }
+        assert!(out.ends_with("        last line"), "{out}");
+        // Nothing is elided, so nothing may claim to be.
+        assert!(!out.contains('\u{2026}'), "{out}");
     }
 
     #[test]
-    fn a_single_line_body_gets_no_ellipsis() {
+    fn a_blank_line_inside_a_body_is_preserved_as_structure() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
-        m.body = "all of it".into();
-        let out = line(&feed, &mut g, &m, plain());
-        assert!(out.ends_with("all of it"), "{out}");
+        m.body = "para one\n\npara two".into();
+        let out = render(&feed, &mut g, &m, false);
+        assert!(
+            out.contains("        para one\n        \n        para two"),
+            "{out:?}"
+        );
     }
 
     #[test]
-    fn full_mode_prints_every_body_line_indented() {
+    fn every_body_line_is_indented_under_the_header() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
         m.body = "one\ntwo".into();
-        let style = Style {
-            colour: false,
-            full: true,
-        };
-        let out = line(&feed, &mut g, &m, style);
+        let out = render(&feed, &mut g, &m, false);
         assert!(out.contains("\n        one\n        two"), "{out:?}");
     }
 
@@ -358,7 +342,7 @@ mod tests {
     fn colour_off_emits_no_escapes() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
-        let out = line(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), plain());
+        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), false);
         assert!(!out.contains('\u{1b}'), "{out:?}");
     }
 
@@ -366,11 +350,7 @@ mod tests {
     fn colour_on_emits_escapes() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
-        let style = Style {
-            colour: true,
-            full: false,
-        };
-        let out = line(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), style);
+        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), true);
         assert!(out.contains("\u{1b}[38;5;"), "{out:?}");
     }
 

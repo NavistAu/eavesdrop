@@ -13,8 +13,11 @@ write. It never sends, never marks a message read, never touches a session.
 ```
 $ eavesdrop
 eavesdrop: 26 transcripts in the last 24h, all sessions, following
-06:34:16    project-bbbb → tmux-bridge-b6      Demo message explaining cross-session messaging
-07:03:26    project-bbbb → tmux-bridge-b6      Ask target to generate sustained output for benchmarking
+00:29:51        eavesdrop-5c → targetagent
+        Please send me one short message — I want to confirm the round trip works.
+00:30:01         targetagent → eavesdrop-5c
+        Round trip confirmed from the tmux-bridge session. For your record: you
+        never appeared in my ListAgents under the old name either.
 ```
 
 Each conversation gets its own colour. A conversation is a connected group of
@@ -43,7 +46,6 @@ it, then follows live.
 | `--pane` | Only agents running in panes of the current tmux window |
 | `--since 30m` | How much history to read first (`90s`, `30m`, `24h`, `7d`) |
 | `--tail N` | Show at most N historical messages |
-| `--full` | Print whole message bodies, not just the first line |
 | `--no-follow` | Print history and exit |
 | `--json` | One JSON object per message, for piping |
 
@@ -71,7 +73,10 @@ One exchange is written to two files:
   ambiguous name and had to be re-sent with a `[ref]` suffix. Unconfirmed sends
   are not shown.
 - The **recipient** records a `queue-operation` enqueue carrying a
-  `<cross-session-message from-name="…">` envelope.
+  `<cross-session-message>` envelope. It comes in two shapes: a send addressed
+  by name arrives as `from-name="<title>"`, while one agent replying to another
+  arrives as `from="uds:<socket>"` with a `hop-chain`. A `uds:` address resolves
+  back to a session through the registry's `messagingSocketPath`.
 
 Neither side carries the other's session id — the sender addresses a registry
 *name*, the recipient is told a conversation *title* — so the two records are
@@ -94,13 +99,12 @@ JSON parser. A 7-day window over 678 files runs in 0.8 s.
   older group's colour survives and the new rows join it. Rows already on
   screen are never retroactively wrong, but the merged group's earlier rows
   keep their original colour.
-- **A row shows the message's first line, never the sender's `summary`.** A
-  summary reads like the better label, but only the *sending* side records one,
-  so preferring it made the column mean "summary" or "first line" depending on
-  which transcript happened to be scanned. The body is the one thing both sides
-  record identically. A trailing `…` marks a line that is an extract, so it is
-  never mistaken for a message truncated in transit. `--json` still carries
-  `summary`, where it is labelled.
+- **Messages print in full, and the sender's `summary` is never shown.** This is
+  a log of what agents said, so the words are the content and everything else is
+  addressing. A summary reads like a tidier label, but only the *sending* side
+  records one — showing it made the text mean different things depending on
+  which transcript happened to be scanned, and hid the message behind a label.
+  `--json` still carries `summary`, where it is labelled.
 - **A late second half is dropped, not re-rendered.** While following, the two
   records reach disk hundreds of milliseconds apart — the recipient's enqueue
   is written immediately, the sender's only once its tool_result lands. Rows
@@ -111,8 +115,10 @@ JSON parser. A 7-day window over 678 files runs in 0.8 s.
   different timestamp, so the two cannot be deduped on time. Ignoring the
   second one also avoids matching any session that merely *discusses*
   cross-session messaging in prose.
-- **Labels degrade.** A live session is named from the registry. After it
-  exits, the name is reconstructed from its working directory, then its
+- **Labels degrade.** An agent is named by what you called it first: the
+  `tb mark` codeword (`@tb_name`), then the pane tag (`@pane_tag`), then the
+  registry name agents use to address each other. After a session exits none of
+  those exist, so the name is reconstructed from its working directory, then its
   conversation title, then a short session id.
 
 ### Unverified
