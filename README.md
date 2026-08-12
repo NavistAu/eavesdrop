@@ -93,7 +93,9 @@ Neither side carries the other's session id — the sender addresses a registry
 *name*, the recipient is told a conversation *title* — so the two records are
 paired on the message body, which is byte-identical across them. That pairing
 is what lets a row name both ends even when one of them has since exited. A row
-that could only be seen from one side says so rather than pretending.
+seen from only one side says so rather than pretending: `(no delivery record)`
+means the recipient's transcript fell outside the window, `(no sender record)`
+the sender's did.
 
 Bounding the read is the load-bearing constraint: a working machine had 1,999
 transcripts totalling 2.5 GB. The mtime filter cuts a 24-hour window to 26

@@ -120,40 +120,65 @@ fn cell(label: &str, right_align: bool) -> String {
 /// A single word longer than `width` (a path, a URL) is emitted whole and
 /// allowed to overflow: breaking it would corrupt something the reader may
 /// want to copy.
+///
+/// The line's own leading whitespace is held aside and re-applied to every
+/// piece, so an indented line stays indented and its continuations hang under
+/// it. Rebuilding from `split_whitespace` instead lost that indent entirely and
+/// collapsed the internal spacing of code blocks — and only when wrapping was
+/// active, so piped output and terminal output disagreed about the same
+/// message.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
+    let prefix: String = text.chars().take_while(|c| c.is_whitespace()).collect();
+    let mut rest = &text[prefix.len()..];
+    if rest.is_empty() {
+        // A blank or whitespace-only line is a paragraph break, and must not
+        // become a line of trailing spaces.
+        return vec![String::new()];
+    }
+    // Always leave room for something, however deep the indent.
+    let avail = width.saturating_sub(prefix.chars().count()).max(8);
+
     let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if current.is_empty() {
-            current.push_str(word);
-        } else if current.chars().count() + 1 + word.chars().count() <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
+    loop {
+        if rest.chars().count() <= avail {
+            lines.push(format!("{prefix}{rest}"));
+            return lines;
+        }
+        let cut = rest
+            .char_indices()
+            .nth(avail)
+            .map_or(rest.len(), |(index, _)| index);
+        let (head, tail) = match rest[..cut].rfind(' ') {
+            Some(at) if at > 0 => (&rest[..at], &rest[at..]),
+            // No break point inside the budget: run the word out to its end
+            // rather than cutting through it.
+            _ => {
+                let end = rest[cut..].find(' ').map_or(rest.len(), |at| cut + at);
+                (&rest[..end], &rest[end..])
+            }
+        };
+        lines.push(format!("{prefix}{head}"));
+        rest = tail.trim_start_matches(' ');
+        if rest.is_empty() {
+            return lines;
         }
     }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    // An all-whitespace input is a paragraph break, not nothing.
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
 }
 
 /// Why a row could not be corroborated from both transcripts. `None` when it
 /// was — the common case, which stays unannotated.
+///
+/// Kept short because it shares the header line: the long form ran a header
+/// past 90 columns and was clipped mid-word. What it means is in the README,
+/// not repeated on every affected row.
 fn caveat(corroboration: Corroboration) -> Option<&'static str> {
     match corroboration {
         Corroboration::Both => None,
-        Corroboration::SentOnly => Some("(sent; recipient transcript not in window)"),
-        Corroboration::RecvOnly => Some("(received; sender transcript not in window)"),
+        Corroboration::SentOnly => Some("(no delivery record)"),
+        Corroboration::RecvOnly => Some("(no sender record)"),
     }
 }
 
@@ -411,7 +436,7 @@ mod tests {
         let mut m = msg("aaaa1111", "bbbb2222");
         m.recv_seen = false;
         let out = render(&feed, &mut g, &m, false, 0);
-        assert!(out.contains("recipient transcript not in window"), "{out}");
+        assert!(out.contains("(no delivery record)"), "{out}");
     }
 
     #[test]
@@ -426,6 +451,59 @@ mod tests {
         let out = render(&feed, &mut g, &m, false, 0);
         assert!(out.ends_with("what was actually said"), "{out}");
         assert!(!out.contains("A tidy summary"), "{out}");
+    }
+
+    #[test]
+    fn an_indented_line_keeps_its_indent_when_wrapped() {
+        // Rebuilding from split_whitespace dropped the leading indent, so a
+        // code block or a bullet rendered flush with ordinary prose — and only
+        // in a terminal, since piped output skips wrapping entirely.
+        let got = wrap(
+            "    for i in $(seq 1 60); do echo hello world; sleep 1; done",
+            30,
+        );
+        assert!(got.len() > 1, "should have wrapped: {got:?}");
+        for line in &got {
+            assert!(line.starts_with("    "), "indent lost on {line:?}");
+        }
+        assert!(got[0].starts_with("    for i in"), "{got:?}");
+    }
+
+    #[test]
+    fn internal_spacing_survives_wrapping() {
+        let got = wrap("name    value    other", 100);
+        assert_eq!(got, vec!["name    value    other".to_string()]);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_width_runs_on_rather_than_being_cut() {
+        let path = "/var/folders/b9/l35bn87547nddkrrmx5r9hq00000gn/T/cc-socks/41696.sock";
+        let got = wrap(&format!("see {path} now"), 20);
+        assert!(
+            got.iter().any(|l| l.contains(path)),
+            "the path must survive whole: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_blank_line_wraps_to_an_empty_line_not_to_spaces() {
+        assert_eq!(wrap("", 40), vec![String::new()]);
+        assert_eq!(wrap("      ", 40), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrapping_respects_the_width_for_ordinary_prose() {
+        for line in wrap("one two three four five six seven eight nine ten", 20) {
+            assert!(line.chars().count() <= 20, "too long: {line:?}");
+        }
+    }
+
+    #[test]
+    fn width_zero_passes_the_line_through_untouched() {
+        assert_eq!(
+            wrap("    keep   me  exactly", 0),
+            vec!["    keep   me  exactly"]
+        );
     }
 
     #[test]

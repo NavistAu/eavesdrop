@@ -88,11 +88,7 @@ impl App {
 
         let rows = self.layout(body_area.width as usize);
         let viewport = body_area.height as usize;
-        let max_scroll = rows.len().saturating_sub(viewport);
-        if self.follow {
-            self.scroll = max_scroll;
-        }
-        self.scroll = self.scroll.min(max_scroll);
+        self.settle(rows.len(), viewport);
 
         let visible: Vec<Line> = rows
             .iter()
@@ -153,11 +149,31 @@ impl App {
         true
     }
 
+    /// Pin the scroll position against the real line count, and decide whether
+    /// the view is still attached to the tail.
+    ///
+    /// Split out of `draw` because it is the whole of the follow behaviour and
+    /// a `Frame` cannot be constructed in a test. Where the bottom sits depends
+    /// on how many lines the messages wrapped to at the current width, which is
+    /// known only here — so scrolling down could not reattach on its own, and a
+    /// single stray keypress used to strand the view above the newest message
+    /// with `G` as the only way back.
+    fn settle(&mut self, total: usize, viewport: usize) {
+        let max_scroll = total.saturating_sub(viewport);
+        if self.follow {
+            self.scroll = max_scroll;
+        }
+        self.scroll = self.scroll.min(max_scroll);
+        if self.scroll == max_scroll {
+            self.follow = true;
+        }
+    }
+
     fn scroll_by(&mut self, delta: isize) {
         self.scroll = self.scroll.saturating_add_signed(delta);
-        // Scrolling up detaches from the tail; scrolling down cannot reattach
-        // on its own, because `draw` clamps to the real maximum and would
-        // otherwise re-enable following the moment the user nudged downward.
+        // Scrolling up detaches from the tail. Scrolling back down reattaches,
+        // but that decision belongs to `draw`, which is the only place that
+        // knows where the bottom currently is.
         if delta < 0 {
             self.follow = false;
         }
@@ -297,6 +313,55 @@ mod tests {
         assert!(!a.follow, "scrolling up must stop auto-scrolling");
         a.on_key(KeyEvent::from(KeyCode::End), 10);
         assert!(a.follow, "End must reattach to the tail");
+    }
+
+    #[test]
+    fn following_pins_the_view_to_the_newest_line() {
+        let mut a = app();
+        a.settle(100, 10);
+        assert_eq!(a.scroll, 90, "a following view sits at the bottom");
+        // More arrives: the view moves with it rather than staying put.
+        a.settle(130, 10);
+        assert_eq!(a.scroll, 120);
+    }
+
+    #[test]
+    fn scrolling_back_to_the_bottom_resumes_following() {
+        let mut a = app();
+        a.settle(100, 10);
+        a.on_key(KeyEvent::from(KeyCode::Up), 10);
+        a.settle(100, 10);
+        assert!(!a.follow, "still detached one line up");
+        assert_eq!(a.scroll, 89);
+
+        a.on_key(KeyEvent::from(KeyCode::Down), 10);
+        a.settle(100, 10);
+        assert!(a.follow, "arriving at the bottom must reattach");
+
+        // And it now tracks new arrivals again without another keypress.
+        a.settle(140, 10);
+        assert_eq!(a.scroll, 130);
+    }
+
+    #[test]
+    fn a_view_scrolled_up_stays_put_while_messages_arrive() {
+        let mut a = app();
+        a.settle(100, 10);
+        a.on_key(KeyEvent::from(KeyCode::PageUp), 10);
+        a.settle(100, 10);
+        let parked = a.scroll;
+        assert!(!a.follow);
+        a.settle(200, 10);
+        assert_eq!(a.scroll, parked, "reading must not be yanked to the tail");
+    }
+
+    #[test]
+    fn a_feed_shorter_than_the_screen_is_always_following() {
+        let mut a = app();
+        a.on_key(KeyEvent::from(KeyCode::Up), 10);
+        a.settle(3, 40);
+        assert_eq!(a.scroll, 0);
+        assert!(a.follow, "nothing to scroll means nothing to detach from");
     }
 
     #[test]

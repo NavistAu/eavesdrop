@@ -220,7 +220,7 @@ fn a_live_exchange_written_to_two_files_prints_as_one_row() {
         "recipient resolved via title: {line}"
     );
     assert!(
-        !line.contains("not in window"),
+        !line.contains("no delivery record"),
         "should be corroborated: {line}"
     );
 
@@ -254,10 +254,7 @@ fn a_history_only_run_reads_what_is_already_on_disk() {
     assert_eq!(message_count(&stdout), 1, "{stdout}");
     assert!(stdout.contains("Landed it"), "{stdout}");
     assert!(!stdout.contains("unrendered-summary"), "{stdout}");
-    assert!(
-        stdout.contains("(sent; recipient transcript not in window)"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("(no delivery record)"), "{stdout}");
 }
 
 #[test]
