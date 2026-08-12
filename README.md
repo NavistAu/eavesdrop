@@ -62,7 +62,22 @@ able to copy what an agent said matters more than wheel scrolling.
 
 `--pane` answers "what are the agents *in front of me* saying to each other".
 It maps the window's panes to sessions through the session registry, so it only
-shows traffic it can prove belongs to this window.
+shows traffic it can prove belongs to this window — and it scopes to the window
+holding the pane it runs in, not whichever window you happen to be looking at.
+
+Finding nothing is a normal result: most windows hold agents that never message
+each other. Rather than a blank screen it names what it scoped to, so an empty
+feed can be told apart from a filter that missed:
+
+```
+No messages in the last 60s.
+
+Watching 5 agents in this tmux window:
+  eavesdrop-5c, targetagent, targetagent2, tmux-bridge-86, tmux-bridge-d9
+
+None of them has messaged another session in this window. Agents in other
+windows are excluded — run without --pane to watch every window.
+```
 
 Colour is suppressed when stdout is not a terminal, or when `NO_COLOR` is set.
 

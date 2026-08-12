@@ -225,6 +225,12 @@ impl Seg {
 /// One rendered line, as its styled runs.
 pub type Row = Vec<Seg>;
 
+/// A line of guidance rather than message content — dimmed, so it never reads
+/// as something an agent said.
+pub fn hint(text: impl Into<String>) -> Seg {
+    Seg::dim(text)
+}
+
 /// A message as a blank separator, a header naming both ends, then the message
 /// itself wrapped to `width`.
 ///

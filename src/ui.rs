@@ -11,7 +11,7 @@
 //! matters more than wheel scrolling. Scrolling is on the keyboard.
 
 use crate::feed::{Feed, Message};
-use crate::render::{message_rows, Groups, Row, Seg};
+use crate::render::{self, message_rows, Groups, Row, Seg};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -42,12 +42,14 @@ pub struct App {
     follow: bool,
     /// The status line's left half: what is being watched.
     pub scope: String,
+    /// Shown in place of the feed while there is nothing in it.
+    pub empty_hint: Vec<String>,
     /// Set when the layout must be recomputed — new message, resize, scroll.
     dirty: bool,
 }
 
 impl App {
-    pub fn new(feed: Feed, scope: String) -> Self {
+    pub fn new(feed: Feed, scope: String, empty_hint: Vec<String>) -> Self {
         Self {
             feed,
             groups: Groups::new(),
@@ -55,6 +57,7 @@ impl App {
             scroll: 0,
             follow: true,
             scope,
+            empty_hint,
             dirty: true,
         }
     }
@@ -72,6 +75,22 @@ impl App {
     /// and unlike the plain stream, a component that merges after the fact
     /// repaints its earlier messages to match.
     fn layout(&mut self, width: usize) -> Vec<Row> {
+        // An empty feed is a normal outcome, not a failure — most tmux windows
+        // hold agents that never message each other. A blank screen cannot be
+        // told apart from a broken filter, so say what was searched instead.
+        if self.messages.is_empty() {
+            return self
+                .empty_hint
+                .iter()
+                .map(|line| {
+                    if line.is_empty() {
+                        Row::new()
+                    } else {
+                        vec![render::hint(format!("    {line}"))]
+                    }
+                })
+                .collect();
+        }
         let mut rows = Vec::new();
         // Split the borrow: `message_rows` needs `&self.feed` and
         // `&mut self.groups` at once.
@@ -261,7 +280,11 @@ mod tests {
     use crate::registry::Registry;
 
     fn app() -> App {
-        App::new(Feed::new(Registry::empty()), "all sessions".into())
+        App::new(
+            Feed::new(Registry::empty()),
+            "all sessions".into(),
+            vec!["No messages.".into()],
+        )
     }
 
     fn message(body: &str) -> Message {
@@ -313,6 +336,38 @@ mod tests {
         assert!(!a.follow, "scrolling up must stop auto-scrolling");
         a.on_key(KeyEvent::from(KeyCode::End), 10);
         assert!(a.follow, "End must reattach to the tail");
+    }
+
+    #[test]
+    fn an_empty_feed_explains_itself_instead_of_going_blank() {
+        let mut a = App::new(
+            Feed::new(Registry::empty()),
+            "this tmux window".into(),
+            vec![
+                "No messages in the last 24h.".into(),
+                String::new(),
+                "Watching 4 agents in this tmux window:".into(),
+            ],
+        );
+        let rows = a.layout(80);
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.iter().map(|s| s.text.clone()))
+            .collect();
+        assert!(text.contains("No messages in the last 24h."), "{text:?}");
+        assert!(text.contains("Watching 4 agents"), "{text:?}");
+        // Dimmed, so guidance never reads as something an agent said.
+        assert!(rows.iter().flatten().all(|s| s.dim), "{rows:?}");
+
+        // And it gives way the moment there is anything to show.
+        a.push(message("real traffic"));
+        let rows = a.layout(80);
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.iter().map(|s| s.text.clone()))
+            .collect();
+        assert!(text.contains("real traffic"), "{text:?}");
+        assert!(!text.contains("No messages"), "{text:?}");
     }
 
     #[test]

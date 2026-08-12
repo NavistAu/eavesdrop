@@ -87,6 +87,11 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 
     let registry = Registry::load();
+    // Named here, while the registry is still owned, so an empty feed can say
+    // exactly which agents it scoped to. `--pane` finding nothing is a normal
+    // outcome — most windows hold agents that never message each other — and
+    // it is indistinguishable from a broken filter unless the tool says so.
+    let mut watching: Vec<String> = Vec::new();
     let filter = if cli.pane {
         let panes = registry
             .current_window_panes()
@@ -98,6 +103,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 panes.len()
             ));
         }
+        watching = sessions.iter().map(|id| registry.label_of(id)).collect();
+        watching.sort();
         Some(sessions.into_iter().collect::<HashSet<_>>())
     } else {
         None
@@ -115,6 +122,28 @@ fn run(cli: Cli) -> Result<(), String> {
         "all sessions"
     };
     let banner = format!("{scanned} transcripts in the last {}, {scope}", cli.since);
+
+    // What to show when the feed is legitimately empty. Naming the agents it
+    // scoped to is the whole point: `--pane` finding nothing is normal, and
+    // without this it is indistinguishable from a filter that is broken.
+    let mut empty_hint = vec![format!("No messages in the last {}.", cli.since)];
+    if cli.pane {
+        empty_hint.push(String::new());
+        empty_hint.push(format!(
+            "Watching {} agent{} in this tmux window:",
+            watching.len(),
+            if watching.len() == 1 { "" } else { "s" }
+        ));
+        empty_hint.push(format!("  {}", watching.join(", ")));
+        empty_hint.push(String::new());
+        empty_hint.push(
+            "None of them has messaged another session in this window. Agents in other".into(),
+        );
+        empty_hint.push("windows are excluded — run without --pane to watch every window.".into());
+    } else {
+        empty_hint.push(String::new());
+        empty_hint.push("Nothing has been sent between sessions yet. Try a longer --since.".into());
+    }
 
     // History is flushed with no grace: every record is already on disk, so
     // there is nothing still in flight to wait for.
@@ -145,6 +174,7 @@ fn run(cli: Cli) -> Result<(), String> {
         filter,
         cutoff,
         banner,
+        empty_hint,
     };
     if interactive {
         return follow_interactive(feed, watcher, start);
@@ -160,6 +190,8 @@ struct Started {
     filter: Option<HashSet<String>>,
     cutoff: chrono::DateTime<chrono::Utc>,
     banner: String,
+    /// Shown instead of an empty feed, naming what was actually searched.
+    empty_hint: Vec<String>,
 }
 
 /// The scrollback view: hold the messages, redraw, re-wrap on resize.
@@ -170,8 +202,9 @@ fn follow_interactive(feed: Feed, mut watcher: Watcher, start: Started) -> Resul
         filter,
         cutoff,
         banner,
+        empty_hint,
     } = start;
-    let mut app = ui::App::new(feed, banner);
+    let mut app = ui::App::new(feed, banner, empty_hint);
     for message in history {
         app.push(message);
     }
@@ -216,6 +249,7 @@ fn follow_plain(
         filter,
         cutoff,
         banner,
+        empty_hint,
     } = start;
     let is_tty = std::io::stdout().is_terminal();
     let colour_on = !cli.json && is_tty && std::env::var_os("NO_COLOR").is_none();
@@ -234,6 +268,14 @@ fn follow_plain(
             "eavesdrop: {banner}{}",
             if cli.no_follow { "" } else { ", following" }
         );
+        // Same reasoning as the interactive empty state: silence after the
+        // banner is indistinguishable from a filter that matched nothing by
+        // mistake. On stderr, so a pipeline still sees an empty stdout.
+        if history.is_empty() {
+            for line in &empty_hint {
+                eprintln!("  {line}");
+            }
+        }
     }
 
     for message in &history {

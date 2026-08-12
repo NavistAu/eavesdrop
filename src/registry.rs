@@ -188,6 +188,23 @@ impl Registry {
         self.by_session.get(session_id).map(|e| e.name.as_str())
     }
 
+    /// The best name the registry alone can give a session: the operator's own
+    /// pane name, else the name agents address it by. `None` once the session
+    /// has exited, since nothing here outlives it — callers that can do better
+    /// (from a transcript's cwd or title) continue from there.
+    pub fn known_label(&self, session_id: &str) -> Option<String> {
+        self.pane_label(session_id)
+            .or_else(|| self.name_of(session_id))
+            .map(String::from)
+    }
+
+    /// `known_label`, falling back to a short session id so there is always
+    /// something to print.
+    pub fn label_of(&self, session_id: &str) -> String {
+        self.known_label(session_id)
+            .unwrap_or_else(|| session_id.chars().take(8).collect())
+    }
+
     pub fn cwd_of(&self, session_id: &str) -> Option<&str> {
         self.by_session
             .get(session_id)

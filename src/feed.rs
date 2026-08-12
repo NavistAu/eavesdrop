@@ -302,11 +302,8 @@ impl Feed {
     /// exists only while the session is alive; everything after that is
     /// reconstruction, ending at a short id that is at least unique.
     fn label_of(&self, session: &str) -> String {
-        if let Some(label) = self.registry.pane_label(session) {
-            return label.to_string();
-        }
-        if let Some(name) = self.registry.name_of(session) {
-            return name.to_string();
+        if let Some(label) = self.registry.known_label(session) {
+            return label;
         }
         let cwd = self
             .cwds
