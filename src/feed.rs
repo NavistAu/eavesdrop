@@ -85,6 +85,16 @@ pub struct Feed {
     cwds: HashMap<String, String>,
     /// Messages not yet handed to the renderer.
     buffer: Vec<Message>,
+    /// Bodies already handed to the renderer, with the time they went out.
+    ///
+    /// The grace window only pairs the two halves of an exchange when both
+    /// reach disk close together, and in follow mode they often do not: the
+    /// recipient's enqueue is written immediately, while the sender's record
+    /// is not complete until its tool_result lands — measured at 558 ms apart
+    /// on one live send, before poll jitter at either end. When the second
+    /// half arrives after its row is already printed, it must be dropped, not
+    /// printed again as a near-duplicate row.
+    emitted: Vec<(DateTime<Utc>, String)>,
 }
 
 impl Feed {
@@ -95,7 +105,16 @@ impl Feed {
             by_title: HashMap::new(),
             cwds: HashMap::new(),
             buffer: Vec::new(),
+            emitted: Vec::new(),
         }
+    }
+
+    /// Whether this body already went out as a row inside the pairing window,
+    /// making a newly-arrived half of it redundant rather than new.
+    fn already_emitted(&self, ts: DateTime<Utc>, body: &str) -> bool {
+        self.emitted
+            .iter()
+            .any(|(at, seen)| seen == body && (*at - ts).num_seconds().abs() <= PAIR_WINDOW_SECS)
     }
 
     pub fn ingest(&mut self, observations: Vec<Observation>) {
@@ -122,6 +141,9 @@ impl Feed {
                         existing.ts = ts;
                         continue;
                     }
+                    if self.already_emitted(ts, &sent.body) {
+                        continue;
+                    }
                     self.buffer.push(Message {
                         ts,
                         from_session: Some(sent.from_session),
@@ -142,6 +164,9 @@ impl Feed {
                         existing.to_session = Some(recv.to_session);
                         existing.from_title = Some(recv.from_title);
                         existing.recv_seen = true;
+                        continue;
+                    }
+                    if self.already_emitted(ts, &recv.body) {
                         continue;
                     }
                     self.buffer.push(Message {
@@ -185,6 +210,10 @@ impl Feed {
         self.buffer = held;
         let mut ready = ready;
         ready.sort_by_key(|m| m.ts);
+        self.emitted
+            .retain(|(at, _)| (now - *at).num_seconds().abs() <= PAIR_WINDOW_SECS);
+        self.emitted
+            .extend(ready.iter().map(|m| (m.ts, m.body.clone())));
         ready
     }
 
@@ -427,6 +456,41 @@ mod tests {
         })]);
         let got = drain(&mut g);
         assert_eq!(g.sender_label(&got[0]), "abcdef01");
+    }
+
+    #[test]
+    fn a_second_half_arriving_after_its_row_printed_is_dropped_not_duplicated() {
+        // The live failure: in follow mode the send was flushed before the
+        // recipient's enqueue reached disk, and the exchange printed twice.
+        let mut f = feed();
+        f.ingest(vec![sent("2026-08-10T20:34:16.184Z", "hello there")]);
+        let first = f.take_ready(parse_ts("2030-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].corroboration(), Corroboration::SentOnly);
+
+        f.ingest(vec![recv("2026-08-10T20:34:16.247Z", "hello there")]);
+        assert!(
+            drain(&mut f).is_empty(),
+            "the late half must not print a second row"
+        );
+    }
+
+    #[test]
+    fn a_repeat_beyond_the_pairing_window_still_prints_after_an_emit() {
+        let mut f = feed();
+        f.ingest(vec![sent("2026-08-10T20:34:16.184Z", "ping")]);
+        assert_eq!(
+            f.take_ready(parse_ts("2026-08-10T20:34:17Z").unwrap(), 0)
+                .len(),
+            1
+        );
+        // Far outside the window: a genuinely new message, not a late half.
+        f.ingest(vec![sent("2026-08-10T21:00:00.000Z", "ping")]);
+        assert_eq!(
+            f.take_ready(parse_ts("2026-08-10T21:00:01Z").unwrap(), 0)
+                .len(),
+            1
+        );
     }
 
     #[test]

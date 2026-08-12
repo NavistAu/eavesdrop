@@ -170,6 +170,19 @@ impl Scanner {
         }
     }
 
+    /// Each marker is tested independently, with no early return.
+    ///
+    /// A record's own *content* can quote another record's marker. An agent
+    /// that writes "carrying a `<cross-session-message>` envelope" into a
+    /// message body produces a `SendMessage` line containing the envelope
+    /// marker; dispatching on the first marker that matches routed that line
+    /// to the envelope parser, which rejected it, and the send was never seen
+    /// at all. This tool dropped exactly one of its own messages that way.
+    ///
+    /// Trying every extractor is safe because each one validates the record
+    /// type it needs, so a mismatch is a cheap no-op rather than a wrong
+    /// parse: an enqueue has no `message.content` blocks, and an assistant
+    /// record is not an enqueue.
     fn feed_line(&mut self, line: &str, out: &mut Vec<Observation>) {
         if line.contains(MARK_TITLE) {
             if let Ok(rec) = serde_json::from_str::<TitleRec>(line) {
@@ -177,15 +190,12 @@ impl Scanner {
                     out.push(Observation::Title { session_id, title });
                 }
             }
-            return;
         }
         if line.contains(MARK_ENVELOPE) {
             self.feed_envelope(line, out);
-            return;
         }
         if line.contains(MARK_SEND) {
             self.feed_send(line);
-            return;
         }
         if line.contains(MARK_MSG_ID) {
             self.feed_send_result(line, out);
@@ -391,6 +401,22 @@ mod tests {
         // double every inbound message.
         let user_copy = r#"{"type":"user","timestamp":"2026-08-10T20:34:16.321Z","sessionId":"aaaa1111","isMeta":true,"message":{"role":"user","content":"Another Claude session sent a message:\n<cross-session-message from-name=\"Optimize tmux-bridge token efficiency for TUIs\" from-mode=\"prompting\">\nhello there\n</cross-session-message>\n\nThis came from another Claude session."}}"#;
         assert_eq!(collect(&[ENQUEUE, user_copy]).len(), 1);
+    }
+
+    #[test]
+    fn a_send_whose_body_quotes_the_envelope_marker_is_still_a_send() {
+        // Observed live: this tool messaged a peer *about* the envelope
+        // format, and the marker inside its own body made the line parse as
+        // an inbound envelope instead of an outbound send. The message
+        // vanished from the feed.
+        let use_line = r#"{"type":"assistant","timestamp":"2026-08-12T14:01:04.488Z","sessionId":"ffff6666","cwd":"/w/e","message":{"content":[{"type":"tool_use","id":"toolu_C","name":"SendMessage","input":{"to":"tmux-bridge-b6 [ab12cd]","summary":"Demo","message":"your transcript records it as an enqueue carrying a <cross-session-message> envelope"}}]}}"#;
+        let result = r#"{"type":"user","message":{"content":[{"tool_use_id":"toolu_C","type":"tool_result","content":[]}]},"toolUseResult":{"success":true,"message":"ok","msg_id":"92a8f607"}}"#;
+        let got = collect(&[use_line, result]);
+        assert_eq!(got.len(), 1, "the send must survive quoting the marker");
+        let Observation::Sent(s) = &got[0] else {
+            panic!("expected Sent, got {got:?}")
+        };
+        assert_eq!(s.to_target, "tmux-bridge-b6 [ab12cd]");
     }
 
     #[test]

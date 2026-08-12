@@ -156,13 +156,27 @@ impl Registry {
 }
 
 /// Pane ids of the tmux window this process is running in, or `None` when not
-/// under tmux. `list-panes` with no target defaults to the current window.
+/// under tmux.
+///
+/// Targeted at `$TMUX_PANE`, not left to default. `list-panes` with no target
+/// means "the *client's* current window", which is wherever the user last
+/// looked — so switching windows silently changed what `--pane` reported, and
+/// reported an empty window once the focus moved somewhere without agents.
+/// tmux sets `$TMUX_PANE` in every process it spawns, and targeting a pane
+/// lists the window containing it, which is the window that actually owns this
+/// process. Falls back to the default when the variable is missing.
 pub fn current_window_panes() -> Option<Vec<String>> {
     std::env::var("TMUX").ok()?;
-    let out = Command::new("tmux")
-        .args(["list-panes", "-F", "#{pane_id}"])
-        .output()
-        .ok()?;
+    let mut args = vec!["list-panes".to_string()];
+    if let Ok(pane) = std::env::var("TMUX_PANE") {
+        if !pane.is_empty() {
+            args.push("-t".to_string());
+            args.push(pane);
+        }
+    }
+    args.push("-F".to_string());
+    args.push("#{pane_id}".to_string());
+    let out = Command::new("tmux").args(&args).output().ok()?;
     if !out.status.success() {
         return None;
     }

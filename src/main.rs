@@ -36,8 +36,16 @@ const REDISCOVER: Duration = Duration::from_secs(2);
 /// history.
 const TAIL_BACK: u64 = 256 * 1024;
 /// How long a message waits before printing, so the other half of the exchange
-/// — written to a different file, ~60 ms later — can be folded in first.
-const GRACE_MS: i64 = 750;
+/// can be folded in first.
+///
+/// The two records' *timestamps* are ~60 ms apart, but that is not what this
+/// has to cover: what matters is when each reaches disk. The recipient's
+/// enqueue is written immediately, while the sender's record is not complete
+/// until its tool_result lands — 558 ms later on one measured send — and each
+/// side is then found up to one `POLL` late. A first attempt at 750 ms split a
+/// real exchange across two rows. `Feed` drops a late second half rather than
+/// reprinting it, so this only needs to cover the common case.
+const GRACE_MS: i64 = 2500;
 
 #[derive(Parser)]
 #[command(

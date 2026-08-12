@@ -94,6 +94,11 @@ JSON parser. A 7-day window over 678 files runs in 0.8 s.
   older group's colour survives and the new rows join it. Rows already on
   screen are never retroactively wrong, but the merged group's earlier rows
   keep their original colour.
+- **A late second half is dropped, not re-rendered.** While following, the two
+  records reach disk hundreds of milliseconds apart — the recipient's enqueue
+  is written immediately, the sender's only once its tool_result lands. Rows
+  wait 2.5 s so the common case pairs; if the other half turns up after that,
+  the row keeps its one-sided caveat rather than printing again.
 - **Only the enqueue record is read** on the receiving side. Claude Code also
   writes the same envelope to a `user` record on delivery, at a slightly
   different timestamp, so the two cannot be deduped on time. Ignoring the
