@@ -39,6 +39,16 @@ const POLL: Duration = Duration::from_millis(400);
 /// reprinting it, so this only needs to cover the common case.
 const GRACE_MS: i64 = 2500;
 
+/// How often the session registry is re-read while following.
+///
+/// The set of agents is not fixed for the life of the run: sessions start,
+/// exit, and restart under new ids. Reading it once meant `--pane` froze its
+/// filter at startup, so an agent that registered later had every message
+/// dropped — the pane was in the window, but its session id was not in the set
+/// the filter was built from. Costs a handful of small JSON reads and one tmux
+/// call, so it runs on its own slower cadence.
+const REGISTRY_REFRESH: Duration = Duration::from_secs(5);
+
 #[derive(Parser)]
 #[command(
     name = "eavesdrop",
@@ -93,16 +103,13 @@ fn run(cli: Cli) -> Result<(), String> {
     // it is indistinguishable from a broken filter unless the tool says so.
     let mut watching: Vec<String> = Vec::new();
     let filter = if cli.pane {
-        let panes = registry
-            .current_window_panes()
-            .ok_or("--pane needs to run inside tmux; $TMUX_PANE is unset or names no known pane")?;
-        let sessions = registry.sessions_in_panes(&panes);
-        if sessions.is_empty() {
-            return Err(format!(
-                "no Claude sessions in this tmux window ({} panes checked)",
-                panes.len()
-            ));
+        if registry.current_window_panes().is_none() {
+            return Err(
+                "--pane needs to run inside tmux; $TMUX_PANE is unset or names no known pane"
+                    .into(),
+            );
         }
+        let sessions = pane_sessions(&registry).ok_or("no Claude sessions in this tmux window")?;
         watching = sessions.iter().map(|id| registry.label_of(id)).collect();
         watching.sort();
         Some(sessions.into_iter().collect::<HashSet<_>>())
@@ -212,9 +219,17 @@ fn follow_interactive(feed: Feed, mut watcher: Watcher, start: Started) -> Resul
     let mut screen = ui::Screen::open().map_err(|e| format!("cannot start the display: {e}"))?;
     let mut observations = Vec::new();
     let mut last_poll = SystemTime::now();
+    let mut last_refresh = SystemTime::now();
+    let mut filter = filter;
+    // A filter exists only under `--pane`, so its presence is the flag.
+    let pane = filter.is_some();
     loop {
         if !ui::tick(&mut screen, &mut app).map_err(|e| format!("display failed: {e}"))? {
             return Ok(());
+        }
+        if last_refresh.elapsed().unwrap_or_default() >= REGISTRY_REFRESH {
+            last_refresh = SystemTime::now();
+            refresh_scope(&mut app.feed, &mut filter, pane);
         }
         if last_poll.elapsed().unwrap_or_default() < POLL {
             continue;
@@ -298,8 +313,14 @@ fn follow_plain(
     }
 
     let mut observations = Vec::new();
+    let mut filter = filter;
+    let mut last_refresh = SystemTime::now();
     loop {
         std::thread::sleep(POLL);
+        if last_refresh.elapsed().unwrap_or_default() >= REGISTRY_REFRESH {
+            last_refresh = SystemTime::now();
+            refresh_scope(&mut feed, &mut filter, cli.pane);
+        }
         watcher.poll(&mut observations);
         if !observations.is_empty() {
             feed.ingest(std::mem::take(&mut observations));
@@ -332,6 +353,29 @@ fn follow_plain(
             return Ok(());
         }
     }
+}
+
+/// Session ids of the agents sharing this tmux window, or `None` when not
+/// filtering by pane. `None` also when tmux cannot answer, so a transient
+/// failure leaves the caller's existing filter in place rather than widening
+/// the feed to every session on the machine.
+fn pane_sessions(registry: &Registry) -> Option<Vec<String>> {
+    let panes = registry.current_window_panes()?;
+    let sessions = registry.sessions_in_panes(&panes);
+    (!sessions.is_empty()).then_some(sessions)
+}
+
+/// Re-read the registry, refresh the labels the feed uses, and widen the pane
+/// filter to any agent that has appeared since. An empty or unavailable result
+/// leaves the existing filter untouched.
+fn refresh_scope(feed: &mut Feed, filter: &mut Option<HashSet<String>>, pane: bool) {
+    let registry = Registry::load();
+    if pane {
+        if let Some(sessions) = pane_sessions(&registry) {
+            *filter = Some(sessions.into_iter().collect());
+        }
+    }
+    feed.set_registry(registry);
 }
 
 /// Keep a message when either end is a session in the pane filter. An endpoint

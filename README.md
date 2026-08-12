@@ -65,6 +65,10 @@ It maps the window's panes to sessions through the session registry, so it only
 shows traffic it can prove belongs to this window — and it scopes to the window
 holding the pane it runs in, not whichever window you happen to be looking at.
 
+The set of agents is re-read every 5s, so one that starts (or restarts, taking
+a new session id) while eavesdrop is running is picked up. Messages it sent
+*before* it registered stay hidden — widening the filter is not retroactive.
+
 Finding nothing is a normal result: most windows hold agents that never message
 each other. Rather than a blank screen it names what it scoped to, so an empty
 feed can be told apart from a filter that missed:

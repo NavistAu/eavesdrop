@@ -102,6 +102,16 @@ impl Feed {
         }
     }
 
+    /// Swap in a freshly read registry.
+    ///
+    /// Sessions start, exit and restart while the feed is running, and every
+    /// name here comes from the registry — so holding the one read at startup
+    /// means an agent that appeared since is labelled by its session id
+    /// forever, and one that restarted keeps its old name.
+    pub fn set_registry(&mut self, registry: Registry) {
+        self.registry = registry;
+    }
+
     /// Whether this body already went out as a row inside the pairing window,
     /// making a newly-arrived half of it redundant rather than new.
     fn already_emitted(&self, ts: DateTime<Utc>, body: &str) -> bool {
