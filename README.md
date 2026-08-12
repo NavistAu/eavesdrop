@@ -24,6 +24,10 @@ Each conversation gets its own colour. A conversation is a connected group of
 agents talking — a supervisor and its four workers is one colour, not five —
 so an interleaved feed stays readable when several are running at once.
 
+In a terminal it runs as a scrollback you can move around in, and it re-wraps
+every message when the window resizes. Piped, or with `--json` or
+`--no-follow`, it is a plain stream instead.
+
 ## Install
 
 ```sh
@@ -48,6 +52,13 @@ it, then follows live.
 | `--tail N` | Show at most N historical messages |
 | `--no-follow` | Print history and exit |
 | `--json` | One JSON object per message, for piping |
+
+In the interactive view: `↑`/`↓` or `j`/`k` scroll a line, `PgUp`/`PgDn` a page,
+`g`/`Home` jumps to the start, `G`/`End` returns to following the tail, and `q`
+or `Esc` quits. Scrolling up detaches from the tail; `G` reattaches.
+
+Mouse capture is deliberately off, so click-drag selection still works — being
+able to copy what an agent said matters more than wheel scrolling.
 
 `--pane` answers "what are the agents *in front of me* saying to each other".
 It maps the window's panes to sessions through the session registry, so it only
@@ -95,10 +106,11 @@ JSON parser. A 7-day window over 678 files runs in 0.8 s.
   This reads message records and session titles, nothing else. It must not
   drift into being a general transcript reader — that is a different tool with
   different privacy properties.
-- **Colour is fixed when a row is printed.** If two groups later merge, the
-  older group's colour survives and the new rows join it. Rows already on
-  screen are never retroactively wrong, but the merged group's earlier rows
-  keep their original colour.
+- **Colour is fixed once printed — in the plain stream only.** If two groups
+  later merge, the older group's colour survives and new rows join it, but the
+  absorbed group's earlier rows keep their original colour, because a stream
+  cannot repaint what has scrolled. The interactive view re-lays out every
+  message on each draw, so there a merge repaints the whole group.
 - **Messages print in full, and the sender's `summary` is never shown.** This is
   a log of what agents said, so the words are the content and everything else is
   addressing. A summary reads like a tidier label, but only the *sending* side

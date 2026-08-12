@@ -24,6 +24,12 @@ const PALETTE: [u8; 8] = [39, 214, 78, 170, 179, 45, 205, 149];
 /// Labels are padded to this width so the arrows line up into a column.
 const LABEL_WIDTH: usize = 18;
 
+/// Left margin for message bodies, holding them clear of the header column.
+const INDENT: &str = "    ";
+
+/// Never wrap narrower than this, however cramped the terminal claims to be.
+const MIN_WRAP: usize = 40;
+
 /// Union-find over endpoint keys, with a colour per component.
 #[derive(Default)]
 pub struct Groups {
@@ -88,21 +94,6 @@ impl Groups {
     }
 }
 
-fn paint(colour_on: bool, code: u8, bold: bool, text: &str) -> String {
-    if !colour_on {
-        return text.to_string();
-    }
-    let weight = if bold { ";1" } else { "" };
-    format!("\u{1b}[38;5;{code}{weight}m{text}\u{1b}[0m")
-}
-
-fn dim(colour_on: bool, text: &str) -> String {
-    if !colour_on {
-        return text.to_string();
-    }
-    format!("\u{1b}[2m{text}\u{1b}[0m")
-}
-
 /// Pad to the arrow column, truncating labels that would break it.
 fn cell(label: &str, right_align: bool) -> String {
     let label = if label.chars().count() > LABEL_WIDTH {
@@ -119,6 +110,43 @@ fn cell(label: &str, right_align: bool) -> String {
     }
 }
 
+/// Break `text` into lines of at most `width` columns, on whitespace.
+///
+/// The terminal will hard-wrap an over-long line by itself, but it wraps to
+/// column 0 — so an indented paragraph loses its indent halfway through and
+/// runs back under the header column, which is what made the feed unreadable.
+/// Wrapping here keeps every physical line inside the margin.
+///
+/// A single word longer than `width` (a path, a URL) is emitted whole and
+/// allowed to overflow: breaking it would corrupt something the reader may
+/// want to copy.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    // An all-whitespace input is a paragraph break, not nothing.
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Why a row could not be corroborated from both transcripts. `None` when it
 /// was — the common case, which stays unannotated.
 fn caveat(corroboration: Corroboration) -> Option<&'static str> {
@@ -129,7 +157,51 @@ fn caveat(corroboration: Corroboration) -> Option<&'static str> {
     }
 }
 
-/// A message as a header line naming both ends, then the message itself.
+/// A styled run of text inside one rendered line.
+///
+/// Layout is computed once, in terms of these, and then adapted — to ANSI for
+/// the plain stream, to `ratatui` spans for the TUI. Two renderers would drift
+/// apart, and the TUI's whole reason for existing is that it re-runs this
+/// layout at the new width every time the terminal resizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seg {
+    pub text: String,
+    pub colour: Option<u8>,
+    pub bold: bool,
+    pub dim: bool,
+}
+
+impl Seg {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            colour: None,
+            bold: false,
+            dim: false,
+        }
+    }
+
+    fn dim(text: impl Into<String>) -> Self {
+        Self {
+            dim: true,
+            ..Self::plain(text)
+        }
+    }
+
+    fn tinted(text: impl Into<String>, colour: u8, bold: bool) -> Self {
+        Self {
+            colour: Some(colour),
+            bold,
+            ..Self::plain(text)
+        }
+    }
+}
+
+/// One rendered line, as its styled runs.
+pub type Row = Vec<Seg>;
+
+/// A message as a blank separator, a header naming both ends, then the message
+/// itself wrapped to `width`.
 ///
 /// The body always prints in full. This is a log of what agents said to each
 /// other, so the words are the content and everything else is addressing; a
@@ -137,7 +209,10 @@ fn caveat(corroboration: Corroboration) -> Option<&'static str> {
 /// cannot read. The sender's `summary` is never shown — only the sending side
 /// records one, so it would make the text mean different things depending on
 /// which transcript fell inside the scan window. `--json` still carries it.
-pub fn render(feed: &Feed, groups: &mut Groups, message: &Message, colour_on: bool) -> String {
+///
+/// `width` of 0 means "do not wrap", for output going somewhere that is not a
+/// terminal.
+pub fn message_rows(feed: &Feed, groups: &mut Groups, message: &Message, width: usize) -> Vec<Row> {
     let (from_key, to_key) = feed.endpoints(message);
     let colour = groups.colour_of(&from_key, &to_key);
 
@@ -146,39 +221,77 @@ pub fn render(feed: &Feed, groups: &mut Groups, message: &Message, colour_on: bo
         .with_timezone(&Local)
         .format("%H:%M:%S")
         .to_string();
-    let from = paint(
-        colour_on,
-        colour,
-        true,
-        &cell(&feed.sender_label(message), true),
-    );
-    // The recipient is padded to the column only when a caveat follows it.
-    // Otherwise it ends the header, and padding would leave trailing spaces
-    // inside the colour escape where no trim can reach them.
     let caveat = caveat(message.corroboration());
     let recipient = feed.recipient_label(message);
-    let to = paint(
-        colour_on,
-        colour,
-        false,
-        &match caveat {
-            Some(_) => cell(&recipient, false),
-            None => recipient,
-        },
-    );
-    let arrow = paint(colour_on, colour, false, "\u{2192}");
 
-    let mut out = format!("{}  {from} {arrow} {to}", dim(colour_on, &time));
+    // A blank line ahead of every header. Bodies are paragraphs, so without it
+    // one message's last line and the next one's header sit flush together and
+    // the headers stop being findable.
+    let mut rows = vec![Row::new()];
+
+    let mut header = vec![
+        Seg::dim(time),
+        Seg::plain("  "),
+        Seg::tinted(cell(&feed.sender_label(message), true), colour, true),
+        Seg::plain(" "),
+        Seg::tinted("\u{2192}", colour, false),
+        Seg::plain(" "),
+        // The recipient is padded to the column only when a caveat follows it;
+        // otherwise it ends the header and the padding would be trailing space.
+        Seg::tinted(
+            match caveat {
+                Some(_) => cell(&recipient, false),
+                None => recipient,
+            },
+            colour,
+            false,
+        ),
+    ];
     if let Some(caveat) = caveat {
-        out.push_str(&format!("  {}", dim(colour_on, caveat)));
+        header.push(Seg::plain("  "));
+        header.push(Seg::dim(caveat));
     }
-    // Body at full weight, not dimmed: it is the thing being read, and the
-    // indent alone is enough to hold it apart from the header above it.
+    rows.push(header);
+
+    // Body at full weight, not dimmed: it is the thing being read.
+    let body_width = if width == 0 {
+        0
+    } else {
+        width.saturating_sub(INDENT.len()).max(MIN_WRAP)
+    };
     for body_line in message.body.lines() {
-        out.push('\n');
-        out.push_str(&format!("        {body_line}"));
+        for wrapped in wrap(body_line, body_width) {
+            // A paragraph break stays an empty row rather than an indent's
+            // worth of trailing space.
+            if wrapped.is_empty() {
+                rows.push(Row::new());
+            } else {
+                rows.push(vec![Seg::plain(format!("{INDENT}{wrapped}"))]);
+            }
+        }
     }
-    out
+    rows
+}
+
+/// A row as a terminal-ready string, with escapes when `colour_on`.
+pub fn row_to_ansi(row: &Row, colour_on: bool) -> String {
+    row.iter()
+        .map(|seg| {
+            if !colour_on {
+                return seg.text.clone();
+            }
+            match seg {
+                Seg { dim: true, .. } => format!("\u{1b}[2m{}\u{1b}[0m", seg.text),
+                Seg {
+                    colour: Some(code), ..
+                } => {
+                    let weight = if seg.bold { ";1" } else { "" };
+                    format!("\u{1b}[38;5;{code}{weight}m{}\u{1b}[0m", seg.text)
+                }
+                _ => seg.text.clone(),
+            }
+        })
+        .collect()
 }
 
 /// One JSON object per message, for piping into something else. Hand-built
@@ -208,6 +321,21 @@ mod tests {
     use crate::extract::{Observation, Sent};
     use crate::feed::parse_ts;
     use crate::registry::Registry;
+
+    /// The rendered message as one string, the way the plain stream prints it.
+    fn render(
+        feed: &Feed,
+        groups: &mut Groups,
+        message: &Message,
+        colour_on: bool,
+        width: usize,
+    ) -> String {
+        message_rows(feed, groups, message, width)
+            .iter()
+            .map(|row| row_to_ansi(row, colour_on))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn msg(from: &str, to: &str) -> Message {
         Message {
@@ -271,7 +399,7 @@ mod tests {
     fn a_corroborated_line_carries_no_caveat() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
-        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), false);
+        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), false, 0);
         assert!(out.contains("\u{2192}"), "{out}");
         assert!(out.ends_with("hi there"), "{out}");
     }
@@ -282,7 +410,7 @@ mod tests {
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
         m.recv_seen = false;
-        let out = render(&feed, &mut g, &m, false);
+        let out = render(&feed, &mut g, &m, false, 0);
         assert!(out.contains("recipient transcript not in window"), "{out}");
     }
 
@@ -295,7 +423,7 @@ mod tests {
         let mut m = msg("aaaa1111", "bbbb2222");
         m.summary = Some("A tidy summary".into());
         m.body = "what was actually said".into();
-        let out = render(&feed, &mut g, &m, false);
+        let out = render(&feed, &mut g, &m, false, 0);
         assert!(out.ends_with("what was actually said"), "{out}");
         assert!(!out.contains("A tidy summary"), "{out}");
     }
@@ -306,11 +434,11 @@ mod tests {
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
         m.body = "first line\n\nmiddle line\nlast line".into();
-        let out = render(&feed, &mut g, &m, false);
+        let out = render(&feed, &mut g, &m, false, 0);
         for expected in ["first line", "middle line", "last line"] {
             assert!(out.contains(expected), "missing {expected:?}: {out}");
         }
-        assert!(out.ends_with("        last line"), "{out}");
+        assert!(out.ends_with("    last line"), "{out}");
         // Nothing is elided, so nothing may claim to be.
         assert!(!out.contains('\u{2026}'), "{out}");
     }
@@ -321,11 +449,9 @@ mod tests {
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
         m.body = "para one\n\npara two".into();
-        let out = render(&feed, &mut g, &m, false);
-        assert!(
-            out.contains("        para one\n        \n        para two"),
-            "{out:?}"
-        );
+        let out = render(&feed, &mut g, &m, false, 0);
+        // The blank line is genuinely empty, not an indent's worth of spaces.
+        assert!(out.contains("\n    para one\n\n    para two"), "{out:?}");
     }
 
     #[test]
@@ -334,15 +460,15 @@ mod tests {
         let mut g = Groups::new();
         let mut m = msg("aaaa1111", "bbbb2222");
         m.body = "one\ntwo".into();
-        let out = render(&feed, &mut g, &m, false);
-        assert!(out.contains("\n        one\n        two"), "{out:?}");
+        let out = render(&feed, &mut g, &m, false, 0);
+        assert!(out.contains("\n    one\n    two"), "{out:?}");
     }
 
     #[test]
     fn colour_off_emits_no_escapes() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
-        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), false);
+        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), false, 0);
         assert!(!out.contains('\u{1b}'), "{out:?}");
     }
 
@@ -350,7 +476,7 @@ mod tests {
     fn colour_on_emits_escapes() {
         let feed = Feed::new(Registry::empty());
         let mut g = Groups::new();
-        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), true);
+        let out = render(&feed, &mut g, &msg("aaaa1111", "bbbb2222"), true, 0);
         assert!(out.contains("\u{1b}[38;5;"), "{out:?}");
     }
 

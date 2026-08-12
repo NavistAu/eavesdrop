@@ -13,28 +13,20 @@ mod extract;
 mod feed;
 mod registry;
 mod render;
+mod ui;
+mod watch;
 
 use clap::Parser;
-use extract::{Observation, Scanner};
 use feed::Feed;
 use registry::Registry;
 use render::Groups;
-use std::collections::{HashMap, HashSet};
-use std::io::{ErrorKind, IsTerminal, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::io::{IsTerminal, Write};
 use std::time::{Duration, SystemTime};
+use watch::Watcher;
 
 /// How often tracked files are checked for new bytes.
 const POLL: Duration = Duration::from_millis(400);
-/// How often the whole projects tree is rescanned for files that have started
-/// moving. Coarser than `POLL` because it stats every transcript on the
-/// machine (~2,000 of them) rather than the handful being followed.
-const REDISCOVER: Duration = Duration::from_secs(2);
-/// How much of a newly-active transcript to read back. A file that starts
-/// growing mid-run was not read at startup, so its triggering message is
-/// already on disk; this recovers it without re-reading a multi-megabyte
-/// history.
-const TAIL_BACK: u64 = 256 * 1024;
 /// How long a message waits before printing, so the other half of the exchange
 /// can be folded in first.
 ///
@@ -112,44 +104,17 @@ fn run(cli: Cli) -> Result<(), String> {
     };
 
     let mut feed = Feed::new(registry);
-    let mut scanner = Scanner::new();
-    let mut tracked: HashMap<PathBuf, u64> = HashMap::new();
+    let mut watcher = Watcher::new(projects);
     let mut observations = Vec::new();
-
-    // Startup: read every transcript touched inside the window, in full. The
-    // mtime filter is what makes this affordable — a day's window is ~26 files
-    // out of ~2,000, and ~120 MB out of ~2.5 GB.
-    let mut scanned = 0usize;
-    for (path, mtime, _) in discover(&projects) {
-        if mtime < cutoff_wall {
-            continue;
-        }
-        if let Some(offset) = read_from(&path, 0, &mut scanner, &mut observations) {
-            tracked.insert(path, offset);
-            scanned += 1;
-        }
-    }
+    let scanned = watcher.scan_initial(cutoff_wall, &mut observations);
     feed.ingest(std::mem::take(&mut observations));
 
-    let colour_on =
-        !cli.json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let mut groups = Groups::new();
-    let mut printed: HashSet<String> = HashSet::new();
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-
-    if !cli.json {
-        let scope = if cli.pane {
-            "this tmux window"
-        } else {
-            "all sessions"
-        };
-        eprintln!(
-            "eavesdrop: {scanned} transcripts in the last {}, {scope}{}",
-            cli.since,
-            if cli.no_follow { "" } else { ", following" }
-        );
-    }
+    let scope = if cli.pane {
+        "this tmux window"
+    } else {
+        "all sessions"
+    };
+    let banner = format!("{scanned} transcripts in the last {}, {scope}", cli.since);
 
     // History is flushed with no grace: every record is already on disk, so
     // there is nothing still in flight to wait for.
@@ -159,6 +124,7 @@ fn run(cli: Cli) -> Result<(), String> {
         .filter(|m| m.ts >= cutoff)
         .filter(|m| passes(&feed, m, filter.as_ref()))
         .collect();
+    let mut printed: HashSet<String> = HashSet::new();
     if let Some(limit) = cli.tail {
         let drop = history.len().saturating_sub(limit);
         for message in history.drain(..drop) {
@@ -167,61 +133,155 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     for message in &history {
         printed.insert(message.key());
-        if emit(&mut out, &feed, &mut groups, message, colour_on, cli.json).is_err() {
+    }
+
+    // The interactive view is for a terminal that is actually being watched.
+    // Piped output, `--json` and `--no-follow` all want a plain stream, and
+    // taking over the screen for any of them would be actively wrong.
+    let interactive = !cli.json && !cli.no_follow && std::io::stdout().is_terminal();
+    let start = Started {
+        history,
+        printed,
+        filter,
+        cutoff,
+        banner,
+    };
+    if interactive {
+        return follow_interactive(feed, watcher, start);
+    }
+    follow_plain(cli, feed, watcher, start)
+}
+
+/// What both follow paths need once the startup scan is done: the history to
+/// show, what has already been accounted for, and the filters to keep applying.
+struct Started {
+    history: Vec<feed::Message>,
+    printed: HashSet<String>,
+    filter: Option<HashSet<String>>,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    banner: String,
+}
+
+/// The scrollback view: hold the messages, redraw, re-wrap on resize.
+fn follow_interactive(feed: Feed, mut watcher: Watcher, start: Started) -> Result<(), String> {
+    let Started {
+        history,
+        mut printed,
+        filter,
+        cutoff,
+        banner,
+    } = start;
+    let mut app = ui::App::new(feed, banner);
+    for message in history {
+        app.push(message);
+    }
+
+    let mut screen = ui::Screen::open().map_err(|e| format!("cannot start the display: {e}"))?;
+    let mut observations = Vec::new();
+    let mut last_poll = SystemTime::now();
+    loop {
+        if !ui::tick(&mut screen, &mut app).map_err(|e| format!("display failed: {e}"))? {
+            return Ok(());
+        }
+        if last_poll.elapsed().unwrap_or_default() < POLL {
+            continue;
+        }
+        last_poll = SystemTime::now();
+        watcher.poll(&mut observations);
+        if !observations.is_empty() {
+            app.feed.ingest(std::mem::take(&mut observations));
+        }
+        for message in app.feed.take_ready(chrono::Utc::now(), GRACE_MS) {
+            if message.ts < cutoff || !printed.insert(message.key()) {
+                continue;
+            }
+            if !passes(&app.feed, &message, filter.as_ref()) {
+                continue;
+            }
+            app.push(message);
+        }
+    }
+}
+
+/// The plain stream: one message after another to stdout, never redrawn.
+fn follow_plain(
+    cli: Cli,
+    mut feed: Feed,
+    mut watcher: Watcher,
+    start: Started,
+) -> Result<(), String> {
+    let Started {
+        history,
+        mut printed,
+        filter,
+        cutoff,
+        banner,
+    } = start;
+    let is_tty = std::io::stdout().is_terminal();
+    let colour_on = !cli.json && is_tty && std::env::var_os("NO_COLOR").is_none();
+    // Zero means "do not wrap": piped output belongs to whatever consumes it.
+    let width = if cli.json || !is_tty {
+        0
+    } else {
+        terminal_width()
+    };
+    let mut groups = Groups::new();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    if !cli.json {
+        eprintln!(
+            "eavesdrop: {banner}{}",
+            if cli.no_follow { "" } else { ", following" }
+        );
+    }
+
+    for message in &history {
+        if emit(
+            &mut out,
+            &feed,
+            &mut groups,
+            message,
+            colour_on,
+            width,
+            cli.json,
+        )
+        .is_err()
+        {
             return Ok(());
         }
     }
-    if out.flush().is_err() {
+    if out.flush().is_err() || cli.no_follow {
         return Ok(());
     }
 
-    if cli.no_follow {
-        return Ok(());
-    }
-
-    let mut last_rediscover = SystemTime::now();
+    let mut observations = Vec::new();
     loop {
         std::thread::sleep(POLL);
-
-        if last_rediscover.elapsed().unwrap_or_default() >= REDISCOVER {
-            last_rediscover = SystemTime::now();
-            for (path, _, len) in discover(&projects) {
-                tracked
-                    .entry(path)
-                    .or_insert_with(|| len.saturating_sub(TAIL_BACK));
-            }
-        }
-
-        for (path, offset) in tracked.iter_mut() {
-            let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else {
-                continue;
-            };
-            if len < *offset {
-                // Truncated or replaced; start over rather than read garbage.
-                *offset = 0;
-            }
-            if len == *offset {
-                continue;
-            }
-            if let Some(new_offset) = read_from(path, *offset, &mut scanner, &mut observations) {
-                *offset = new_offset;
-            }
-        }
-
+        watcher.poll(&mut observations);
         if !observations.is_empty() {
             feed.ingest(std::mem::take(&mut observations));
         }
 
-        let ready = feed.take_ready(chrono::Utc::now(), GRACE_MS);
         let mut wrote = false;
-        for message in ready {
+        for message in feed.take_ready(chrono::Utc::now(), GRACE_MS) {
             if message.ts < cutoff || !printed.insert(message.key()) {
                 continue;
             }
             if !passes(&feed, &message, filter.as_ref()) {
                 continue;
             }
-            if emit(&mut out, &feed, &mut groups, &message, colour_on, cli.json).is_err() {
+            if emit(
+                &mut out,
+                &feed,
+                &mut groups,
+                &message,
+                colour_on,
+                width,
+                cli.json,
+            )
+            .is_err()
+            {
                 return Ok(());
             }
             wrote = true;
@@ -247,74 +307,38 @@ fn emit(
     groups: &mut Groups,
     message: &feed::Message,
     colour_on: bool,
+    width: usize,
     as_json: bool,
 ) -> std::io::Result<()> {
-    let text = if as_json {
-        render::json(feed, message)
-    } else {
-        render::render(feed, groups, message, colour_on)
-    };
-    writeln!(out, "{text}")
-}
-
-/// Every transcript under `projects`, with its mtime and length. Unreadable
-/// directories and entries are skipped; there is no state to corrupt by
-/// missing one.
-fn discover(projects: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
-    let mut out = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(projects) else {
-        return out;
-    };
-    for dir in dirs.flatten() {
-        let Ok(files) = std::fs::read_dir(dir.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Ok(meta) = file.metadata() else { continue };
-            let Ok(mtime) = meta.modified() else { continue };
-            out.push((path, mtime, meta.len()));
-        }
+    if as_json {
+        return writeln!(out, "{}", render::json(feed, message));
     }
-    out
+    for row in render::message_rows(feed, groups, message, width) {
+        writeln!(out, "{}", render::row_to_ansi(&row, colour_on))?;
+    }
+    Ok(())
 }
 
-/// Read `path` from `offset`, extract observations, and return the new offset.
+/// Columns available for output, or a sane default.
 ///
-/// Stops at the last newline in what it read: a transcript is appended to
-/// live, so the tail of a read can be half a line. The unread remainder is
-/// picked up next poll, when it is complete.
-fn read_from(
-    path: &Path,
-    offset: u64,
-    scanner: &mut Scanner,
-    out: &mut Vec<Observation>,
-) -> Option<u64> {
-    let mut file = std::fs::File::open(path).ok()?;
-    if offset > 0 {
-        file.seek(SeekFrom::Start(offset)).ok()?;
-    }
-    let mut bytes = Vec::new();
-    if let Err(error) = file.read_to_end(&mut bytes) {
-        if error.kind() != ErrorKind::Interrupted {
-            return None;
-        }
-    }
-    let end = bytes.iter().rposition(|b| *b == b'\n')? + 1;
-    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    // A mid-run tail-back lands in the middle of a line; that fragment is not
-    // valid JSON and would be discarded anyway, but dropping it here keeps the
-    // scanner's input honest.
-    if offset > 0 && text.starts_with(|c: char| c != '{') {
-        if let Some(newline) = text.find('\n') {
-            text = text.split_off(newline + 1);
-        }
-    }
-    scanner.feed(&text, out);
-    Some(offset + end as u64)
+/// Asked once at startup via `tput`, rather than taking a dependency for one
+/// number. A resize mid-follow is not tracked; the width only decides where
+/// paragraphs fold, so a stale value degrades to text narrower or wider than
+/// ideal, never to text that is wrong.
+fn terminal_width() -> usize {
+    std::process::Command::new("tput")
+        .arg("cols")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        .filter(|cols| *cols > 0)
+        .unwrap_or(100)
 }
 
 /// Parse `90s`, `30m`, `24h`, `7d`. A bare number is seconds.
@@ -352,56 +376,5 @@ mod tests {
         assert_eq!(parse_duration("-5m"), None);
         assert_eq!(parse_duration("2 weeks"), None);
         assert_eq!(parse_duration("99999999999999999999d"), None);
-    }
-
-    #[test]
-    fn reading_stops_at_the_last_complete_line() {
-        let dir = std::env::temp_dir().join(format!("eavesdrop-read-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.jsonl");
-        let title = r#"{"type":"ai-title","aiTitle":"T","sessionId":"s1"}"#;
-        std::fs::write(&path, format!("{title}\n{{\"partial\"")).unwrap();
-
-        let mut scanner = Scanner::new();
-        let mut out = Vec::new();
-        let offset = read_from(&path, 0, &mut scanner, &mut out).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(offset, title.len() as u64 + 1);
-
-        // The partial line completes; the next read picks it up whole.
-        std::fs::write(&path, format!("{title}\n{title}\n")).unwrap();
-        let offset = read_from(&path, offset, &mut scanner, &mut out).unwrap();
-        assert_eq!(out.len(), 2);
-        assert_eq!(offset, (title.len() as u64 + 1) * 2);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_file_with_no_newline_yet_yields_nothing_and_no_offset() {
-        let dir = std::env::temp_dir().join(format!("eavesdrop-nonl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.jsonl");
-        std::fs::write(&path, "{\"half").unwrap();
-        let mut scanner = Scanner::new();
-        let mut out = Vec::new();
-        assert!(read_from(&path, 0, &mut scanner, &mut out).is_none());
-        assert!(out.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_mid_line_tail_back_drops_the_leading_fragment() {
-        let dir = std::env::temp_dir().join(format!("eavesdrop-tailback-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.jsonl");
-        let title = r#"{"type":"ai-title","aiTitle":"T","sessionId":"s1"}"#;
-        std::fs::write(&path, format!("{title}\n{title}\n")).unwrap();
-
-        let mut scanner = Scanner::new();
-        let mut out = Vec::new();
-        // Start 10 bytes into the first line, as a tail-back would.
-        read_from(&path, 10, &mut scanner, &mut out).unwrap();
-        assert_eq!(out.len(), 1, "only the one whole line should be seen");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

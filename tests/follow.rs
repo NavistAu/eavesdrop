@@ -110,11 +110,17 @@ impl Follower {
         self.lines.recv_timeout(WAIT)
     }
 
-    /// A header line plus `body_lines` following body lines, joined. The count
-    /// is passed in because a body ends only when the next message starts or
-    /// the feed goes quiet, which a reader cannot tell apart in time.
+    /// A header line plus `body_lines` following body lines, joined. Leading
+    /// blanks are skipped: every message is preceded by a separator line. The
+    /// body count is passed in because a body ends only when the next message
+    /// starts or the feed goes quiet, which a reader cannot tell apart in time.
     fn next_message(&self, body_lines: usize) -> Result<String, RecvTimeoutError> {
-        let mut out = self.next_line()?;
+        let mut out = loop {
+            let line = self.next_line()?;
+            if !line.trim().is_empty() {
+                break line;
+            }
+        };
         for _ in 0..body_lines {
             out.push('\n');
             out.push_str(&self.next_line()?);
@@ -355,7 +361,7 @@ fn the_whole_body_prints_with_no_flag_to_ask_for_it() {
     fixture.append("a", &send_ok("toolu_1"));
     let stdout = String::from_utf8(fixture.run(&["--since", "1h", "--no-follow"]).stdout).unwrap();
     assert!(
-        stdout.contains("\n        line one\n        line two\n        line three"),
+        stdout.contains("\n    line one\n    line two\n    line three"),
         "{stdout:?}"
     );
     // The header names both ends; the body carries the words. Nothing elided.
