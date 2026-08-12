@@ -12,7 +12,7 @@
 //! milliseconds apart in practice (63 ms in the observed case), and the window
 //! stops a genuinely repeated message from being folded into its earlier twin.
 
-use crate::extract::Observation;
+use crate::extract::{Observation, Sender};
 use crate::registry::Registry;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -40,7 +40,8 @@ pub enum Corroboration {
 pub struct Message {
     pub ts: DateTime<Utc>,
     pub from_session: Option<String>,
-    pub from_title: Option<String>,
+    /// How the inbound envelope named the sender, when one was seen.
+    pub from_hint: Option<Sender>,
     pub to_session: Option<String>,
     /// The target as addressed, e.g. `tmux-bridge-b6 [ab12cd]`.
     pub to_target: Option<String>,
@@ -147,7 +148,7 @@ impl Feed {
                     self.buffer.push(Message {
                         ts,
                         from_session: Some(sent.from_session),
-                        from_title: None,
+                        from_hint: None,
                         to_session: None,
                         to_target: Some(sent.to_target),
                         summary: sent.summary,
@@ -162,7 +163,7 @@ impl Feed {
                     };
                     if let Some(existing) = self.find_pair(ts, &recv.body, |m| !m.recv_seen) {
                         existing.to_session = Some(recv.to_session);
-                        existing.from_title = Some(recv.from_title);
+                        existing.from_hint = Some(recv.from);
                         existing.recv_seen = true;
                         continue;
                     }
@@ -172,7 +173,7 @@ impl Feed {
                     self.buffer.push(Message {
                         ts,
                         from_session: None,
-                        from_title: Some(recv.from_title),
+                        from_hint: Some(recv.from),
                         to_session: Some(recv.to_session),
                         to_target: None,
                         summary: None,
@@ -228,13 +229,28 @@ impl Feed {
         if let Some(session) = &message.from_session {
             return session.clone();
         }
-        if let Some(title) = &message.from_title {
-            if let Some(session) = self.by_title.get(title) {
-                return session.clone();
-            }
-            return format!("title:{title}");
+        match self.resolve_sender(message) {
+            Resolved::Session(session) => session,
+            Resolved::Unresolved(key) => key,
         }
-        "?".into()
+    }
+
+    /// Turn an inbound envelope's sender hint into a session id where possible.
+    /// A title is looked up in the index built from `ai-title` records; a
+    /// socket path is looked up in the registry, which is the only place the
+    /// two are connected.
+    fn resolve_sender(&self, message: &Message) -> Resolved {
+        match &message.from_hint {
+            Some(Sender::Title(title)) => match self.by_title.get(title) {
+                Some(session) => Resolved::Session(session.clone()),
+                None => Resolved::Unresolved(format!("title:{title}")),
+            },
+            Some(Sender::Socket(socket)) => match self.registry.session_for_socket(socket) {
+                Some(session) => Resolved::Session(session.to_string()),
+                None => Resolved::Unresolved(format!("uds:{socket}")),
+            },
+            None => Resolved::Unresolved("?".into()),
+        }
     }
 
     fn recipient_key(&self, message: &Message) -> String {
@@ -254,13 +270,17 @@ impl Feed {
         if let Some(session) = &message.from_session {
             return self.label_of(session);
         }
-        if let Some(title) = &message.from_title {
-            return match self.by_title.get(title) {
-                Some(session) => self.label_of(session),
-                None => truncate(title, 28),
-            };
+        match self.resolve_sender(message) {
+            Resolved::Session(session) => self.label_of(&session),
+            // An unresolved socket is a live inbox nobody in the registry
+            // claims; its file name is `<pid>.sock`, which at least identifies
+            // the process rather than showing a 90-character path.
+            Resolved::Unresolved(_) => match &message.from_hint {
+                Some(Sender::Title(title)) => truncate(title, 28),
+                Some(Sender::Socket(socket)) => socket_leaf(socket),
+                None => "?".into(),
+            },
         }
-        "?".into()
     }
 
     pub fn recipient_label(&self, message: &Message) -> String {
@@ -270,16 +290,29 @@ impl Feed {
         match &message.to_target {
             Some(target) => match self.registry.session_for_target(target) {
                 Some(session) => self.label_of(session),
-                None => bare_target(target).to_string(),
+                // An unresolved `uds:` target would otherwise print its whole
+                // socket path and swamp the column.
+                None => match target.strip_prefix("uds:") {
+                    Some(socket) => socket_leaf(socket),
+                    None => bare_target(target).to_string(),
+                },
             },
             None => "?".into(),
         }
     }
 
-    /// Best available name for a session. The registry has the name the agents
-    /// themselves use, but only while the session is alive; everything after
-    /// it is reconstruction, ending at a short id that is at least unique.
+    /// Best available name for a session.
+    ///
+    /// Operator-set names win: the `tb mark` codeword, then the pane tag. Those
+    /// are what the person watching the feed actually calls the agent, and they
+    /// are stable across restarts in a way the generated name is not. Below
+    /// them sits the registry name the agents use to address each other, which
+    /// exists only while the session is alive; everything after that is
+    /// reconstruction, ending at a short id that is at least unique.
     fn label_of(&self, session: &str) -> String {
+        if let Some(label) = self.registry.pane_label(session) {
+            return label.to_string();
+        }
         if let Some(name) = self.registry.name_of(session) {
             return name.to_string();
         }
@@ -296,6 +329,19 @@ impl Feed {
         }
         short(session, 8).to_string()
     }
+}
+
+/// Outcome of turning a sender hint into a session id: either it resolved, or
+/// it is a stable grouping key that at least keeps the same agent together
+/// across rows.
+enum Resolved {
+    Session(String),
+    Unresolved(String),
+}
+
+/// The `<pid>.sock` file name of an inbox path, as a last-resort label.
+fn socket_leaf(socket: &str) -> String {
+    socket.rsplit('/').next().unwrap_or(socket).to_string()
 }
 
 fn bare_target(target: &str) -> &str {
@@ -344,7 +390,7 @@ mod tests {
         Observation::Recv(Recv {
             ts: ts.into(),
             to_session: "aaaa1111-bbbb".into(),
-            from_title: "Optimize tmux-bridge token efficiency".into(),
+            from: Sender::Title("Optimize tmux-bridge token efficiency".into()),
             body: body.into(),
         })
     }
@@ -424,6 +470,72 @@ mod tests {
         // label — and crucially the endpoint key is the session id, so it
         // groups with that session's other traffic.
         assert_eq!(f.endpoints(&got[0]).0, "bbbb2222-aaaa");
+    }
+
+    #[test]
+    fn a_socket_sender_resolves_through_the_registry_to_a_session() {
+        use crate::registry::Entry;
+        let registry = Registry::from_parts(
+            vec![Entry {
+                session_id: "aaaa1111".into(),
+                name: "tmux-bridge-b6".into(),
+                cwd: None,
+                pane: None,
+                socket: Some("/var/folders/b9/T/cc-socks/34388.sock".into()),
+            }],
+            HashMap::new(),
+        );
+        let mut f = Feed::new(registry);
+        f.ingest(vec![Observation::Recv(Recv {
+            ts: "2026-08-12T14:14:44.431Z".into(),
+            to_session: "bbbb2222".into(),
+            from: Sender::Socket("/var/folders/b9/T/cc-socks/34388.sock".into()),
+            body: "what version are you".into(),
+        })]);
+        let got = drain(&mut f);
+        assert_eq!(f.endpoints(&got[0]).0, "aaaa1111");
+        assert_eq!(f.sender_label(&got[0]), "tmux-bridge-b6");
+    }
+
+    #[test]
+    fn an_unclaimed_socket_degrades_to_its_pid_file_name() {
+        let mut f = feed();
+        f.ingest(vec![Observation::Recv(Recv {
+            ts: "2026-08-12T14:14:44.431Z".into(),
+            to_session: "bbbb2222".into(),
+            from: Sender::Socket("/var/folders/b9/T/cc-socks/34388.sock".into()),
+            body: "x".into(),
+        })]);
+        let got = drain(&mut f);
+        // Not the full 90-character path, which would swamp the column.
+        assert_eq!(f.sender_label(&got[0]), "34388.sock");
+    }
+
+    #[test]
+    fn a_uds_target_resolves_the_same_way_a_name_does() {
+        use crate::registry::Entry;
+        let registry = Registry::from_parts(
+            vec![Entry {
+                session_id: "aaaa1111".into(),
+                name: "tmux-bridge-b6".into(),
+                cwd: None,
+                pane: None,
+                socket: Some("/var/folders/b9/T/cc-socks/34388.sock".into()),
+            }],
+            HashMap::new(),
+        );
+        let mut f = Feed::new(registry);
+        f.ingest(vec![Observation::Sent(Sent {
+            ts: "2026-08-12T14:14:55.401Z".into(),
+            from_session: "bbbb2222".into(),
+            from_cwd: None,
+            to_target: "uds:/var/folders/b9/T/cc-socks/34388.sock".into(),
+            summary: Some("Version answer".into()),
+            body: "2.1.228".into(),
+        })]);
+        let got = drain(&mut f);
+        assert_eq!(f.recipient_label(&got[0]), "tmux-bridge-b6");
+        assert_eq!(f.endpoints(&got[0]).1, "aaaa1111");
     }
 
     #[test]

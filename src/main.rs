@@ -100,8 +100,9 @@ fn run(cli: Cli) -> Result<(), String> {
 
     let registry = Registry::load();
     let filter = if cli.pane {
-        let panes = registry::current_window_panes()
-            .ok_or("--pane needs to run inside tmux; $TMUX is unset or tmux is unavailable")?;
+        let panes = registry
+            .current_window_panes()
+            .ok_or("--pane needs to run inside tmux; $TMUX_PANE is unset or names no known pane")?;
         let sessions = registry.sessions_in_panes(&panes);
         if sessions.is_empty() {
             return Err(format!(

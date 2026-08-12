@@ -68,13 +68,25 @@ pub struct Sent {
     pub body: String,
 }
 
+/// How an inbound envelope identifies whoever sent it. Two forms occur, and
+/// neither is a session id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sender {
+    /// `from-name="…"` — the sender's *conversation title*, not its registry
+    /// name. Written when a person's session addressed a peer by name.
+    Title(String),
+    /// `from="uds:…"` — the sender's inbox socket path, written when one agent
+    /// messages another. The reply is addressed straight back to this path, so
+    /// an agent-to-agent thread never mentions a name at all.
+    Socket(String),
+}
+
 /// An inbound message, seen from the recipient's transcript.
 #[derive(Debug, Clone)]
 pub struct Recv {
     pub ts: String,
     pub to_session: String,
-    /// The sender's conversation title, not its registry name.
-    pub from_title: String,
+    pub from: Sender,
     pub body: String,
 }
 
@@ -220,7 +232,7 @@ impl Scanner {
         out.push(Observation::Recv(Recv {
             ts,
             to_session,
-            from_title: envelope.from_name,
+            from: envelope.from,
             body: envelope.body,
         }));
     }
@@ -291,11 +303,17 @@ impl Scanner {
 }
 
 struct Envelope {
-    from_name: String,
+    from: Sender,
     body: String,
 }
 
-/// Split `<cross-session-message from-name="…" …>BODY</cross-session-message>`.
+/// Split `<cross-session-message …>BODY</cross-session-message>`.
+///
+/// Two attribute sets occur and both must parse. A send addressed by name
+/// arrives as `from-name="<title>" from-mode="…"`; an agent replying to a peer
+/// arrives as `from="uds:<socket>" hop-chain="…" from-mode="…"`. Requiring
+/// `from-name` silently dropped every agent-to-agent receive, which is exactly
+/// the traffic worth watching.
 ///
 /// Deliberately a literal scan rather than an XML parse: the envelope is
 /// generated, not user-authored, and the body is free prose that may itself
@@ -305,14 +323,22 @@ fn parse_envelope(content: &str) -> Option<Envelope> {
     let rest = &content[start..];
     let open_end = rest.find('>')?;
     let attrs = &rest[..open_end];
-    let from_name = attr(attrs, "from-name")?;
+    // `from-name` is checked first: `attr` matches on a substring, and the
+    // key "from" would otherwise also match inside `from-name="…"`.
+    let from = match attr(attrs, "from-name") {
+        Some(title) => Sender::Title(title),
+        None => {
+            let raw = attr(attrs, "from")?;
+            Sender::Socket(raw.strip_prefix("uds:").unwrap_or(&raw).to_string())
+        }
+    };
     let after_open = &rest[open_end + 1..];
     let body = match after_open.find("</cross-session-message>") {
         Some(close) => &after_open[..close],
         None => after_open,
     };
     Some(Envelope {
-        from_name,
+        from,
         body: body.trim().to_string(),
     })
 }
@@ -354,8 +380,8 @@ mod tests {
         };
         assert_eq!(r.to_session, "aaaa1111");
         assert_eq!(
-            r.from_title,
-            "Optimize tmux-bridge token efficiency for TUIs"
+            r.from,
+            Sender::Title("Optimize tmux-bridge token efficiency for TUIs".into())
         );
         assert_eq!(r.body, "hello there");
         assert_eq!(r.ts, "2026-08-10T20:34:16.247Z");
@@ -443,13 +469,45 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_to_agent_envelope_names_its_sender_by_socket() {
+        // Observed live between two peers. No `from-name` at all: the sender is
+        // an inbox path and there is an extra `hop-chain` attribute. Requiring
+        // `from-name` dropped every one of these, which is the traffic worth
+        // watching in the first place.
+        let line = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-12T14:14:55.421Z","sessionId":"11112222","content":"<cross-session-message from=\"uds:/var/folders/b9/T/cc-socks/41696.sock\" hop-chain=\"3333444455556666,7777888899990000\" from-mode=\"prompting\">\nClaude Code 2.1.228\n</cross-session-message>"}"#;
+        let got = collect(&[line]);
+        assert_eq!(got.len(), 1);
+        let Observation::Recv(r) = &got[0] else {
+            panic!("expected Recv, got {got:?}")
+        };
+        assert_eq!(
+            r.from,
+            Sender::Socket("/var/folders/b9/T/cc-socks/41696.sock".into()),
+            "the uds: prefix is an address scheme, not part of the path"
+        );
+        assert_eq!(r.body, "Claude Code 2.1.228");
+    }
+
+    #[test]
+    fn from_name_wins_over_a_substring_match_on_from() {
+        // `attr` matches a substring, so the key "from" also occurs inside
+        // `from-name="…"`. Checking `from-name` first is what keeps a named
+        // sender from being read as a socket address.
+        let e = parse_envelope(
+            "<cross-session-message from-name=\"Some Title\" from-mode=\"prompting\">\nbody\n</cross-session-message>",
+        )
+        .unwrap();
+        assert_eq!(e.from, Sender::Title("Some Title".into()));
+    }
+
+    #[test]
     fn envelope_body_keeps_its_own_angle_brackets() {
         let e = parse_envelope(
             "<cross-session-message from-name=\"T\" from-mode=\"prompting\">\nuse <div> tags\n</cross-session-message>",
         )
         .unwrap();
         assert_eq!(e.body, "use <div> tags");
-        assert_eq!(e.from_name, "T");
+        assert_eq!(e.from, Sender::Title("T".into()));
     }
 
     #[test]

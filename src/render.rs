@@ -217,7 +217,7 @@ mod tests {
         Message {
             ts: parse_ts("2026-08-10T20:34:16.184Z").unwrap(),
             from_session: Some(from.into()),
-            from_title: None,
+            from_hint: None,
             to_session: Some(to.into()),
             to_target: Some(to.into()),
             summary: Some("hi".into()),
