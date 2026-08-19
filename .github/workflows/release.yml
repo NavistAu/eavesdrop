@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if Cargo.toml's version is already tagged"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # Every push to `main` is a release: `main` only advances via the develop->main
+  # release PR (the gate). This workflow reads the version from Cargo.toml and
+  # releases it unless that tag already exists. There is no tag-push trigger, so
+  # no PAT / App token is needed — the provenance tag `vX.Y.Z` is created inside
+  # the run by the `release` job using the default GITHUB_TOKEN (nothing is
+  # *triggered* by it, so the token's recursion suppression does not matter).
+  # Manual re-release: run via workflow_dispatch with `force: true`.
+  gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decide whether to release
+        id: decide
+        run: |
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "Forced release of ${TAG}."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists; nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Releasing ${TAG}."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --version 0.2.5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../eavesdrop-${{ needs.gate.outputs.tag }}-${{ matrix.target }}.tar.gz eavesdrop
+          cd ../../..
+          shasum -a 256 eavesdrop-${{ needs.gate.outputs.tag }}-${{ matrix.target }}.tar.gz > eavesdrop-${{ needs.gate.outputs.tag }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eavesdrop-${{ matrix.target }}
+          path: |
+            eavesdrop-*.tar.gz
+            eavesdrop-*.tar.gz.sha256
+
+  release:
+    name: Create Release
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Triggered on push to main (not a tag), so name the tag explicitly;
+          # the action creates `vX.Y.Z` on this commit with GITHUB_TOKEN.
+          tag_name: ${{ needs.gate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            eavesdrop-*.tar.gz
+            eavesdrop-*.tar.gz.sha256
+
+  publish-homebrew:
+    name: Update Homebrew tap
+    needs: [gate, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: NavistAu/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: eavesdrop-*-apple-darwin
+          merge-multiple: true
+          path: artifacts
+
+      - name: Generate formula
+        run: |
+          VERSION="${{ needs.gate.outputs.version }}"
+          ARM_SHA=$(shasum -a 256 artifacts/eavesdrop-${{ needs.gate.outputs.tag }}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          INTEL_SHA=$(shasum -a 256 artifacts/eavesdrop-${{ needs.gate.outputs.tag }}-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+
+          cat > homebrew-tap/Formula/eavesdrop.rb << FORMULA
+          class Eavesdrop < Formula
+            desc "Read-only tail of cross-session messages between Claude Code agents"
+            homepage "https://github.com/NavistAu/eavesdrop"
+            version "${VERSION}"
+            license "AGPL-3.0-only"
+
+            if Hardware::CPU.arm?
+              url "https://github.com/NavistAu/eavesdrop/releases/download/${{ needs.gate.outputs.tag }}/eavesdrop-${{ needs.gate.outputs.tag }}-aarch64-apple-darwin.tar.gz"
+              sha256 "${ARM_SHA}"
+            else
+              url "https://github.com/NavistAu/eavesdrop/releases/download/${{ needs.gate.outputs.tag }}/eavesdrop-${{ needs.gate.outputs.tag }}-x86_64-apple-darwin.tar.gz"
+              sha256 "${INTEL_SHA}"
+            end
+
+            def install
+              bin.install "eavesdrop"
+            end
+
+            test do
+              assert_match "eavesdrop", shell_output("#{bin}/eavesdrop --version")
+            end
+          end
+          FORMULA
+
+      - name: Push formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/eavesdrop.rb
+          git commit -m "eavesdrop ${{ needs.gate.outputs.tag }}"
+          git push

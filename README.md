@@ -39,7 +39,16 @@ every message when the window resizes. Piped, or with `--json` or
 
 ## Install
 
-Clone the repo and build from source:
+Homebrew (macOS):
+
+```sh
+brew install navistau/tap/eavesdrop
+```
+
+Or grab a prebuilt binary from the [releases page](https://github.com/navistau/eavesdrop/releases) —
+one `.tar.gz` per platform, each with a `.sha256` to verify it against.
+
+Or clone the repo and build from source:
 
 ```sh
 mise run release
