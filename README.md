@@ -1,5 +1,8 @@
 # eavesdrop
 
+[![CI](https://github.com/navistau/eavesdrop/actions/workflows/ci.yml/badge.svg)](https://github.com/navistau/eavesdrop/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+
 A read-only tail of the messages Claude Code sessions send each other.
 
 Sessions can message each other with `SendMessage`, but nothing shows that
@@ -28,7 +31,22 @@ In a terminal it runs as a scrollback you can move around in, and it re-wraps
 every message when the window resizes. Piped, or with `--json` or
 `--no-follow`, it is a plain stream instead.
 
+## Requirements
+
+- Rust 1.95 or later, to build from source.
+- A Linux (x86_64 or aarch64) or macOS (aarch64) machine, for a release binary.
+- Claude Code 2.1.224 or later — the version that added `SendMessage` and
+  `ListAgents`.
+
 ## Install
+
+### From a release binary
+
+Download the archive for your platform from the
+[latest release](https://github.com/navistau/eavesdrop/releases/latest),
+extract it, and put `eavesdrop` on your `PATH`.
+
+### From source
 
 ```sh
 mise run release
@@ -39,6 +57,10 @@ The install is a mise task rather than part of the build because cargo has no
 post-build hook — `build.rs` runs before the binary is linked.
 
 Needs Rust 1.95 (`mise install` picks it up from `mise.toml`).
+
+Building from source gets you the current `develop` tip's behaviour; a
+release binary is pinned to a tagged version. Prefer source if you're
+tracking a fix that hasn't shipped yet.
 
 ## Use
 
@@ -170,3 +192,18 @@ JSON parser. A 7-day window over 678 files runs in 0.8 s.
   conversational shape, and far more of it — 248 such sends against 3
   cross-session ones over six days on the development machine. It would need
   its own flag so the default feed stays readable.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch model, local build and
+test steps, and documentation style. This project follows the
+[Contributor Covenant](CODE_OF_CONDUCT.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md) to report a vulnerability privately.
+
+## License
+
+[AGPL-3.0-only](LICENSE). It reads a session's transcripts; the network-use
+clause keeps hosted variants of this tool open-source too.

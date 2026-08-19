@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Read-only tail of cross-session messages between Claude Code agents"
+license = "AGPL-3.0-only"
+repository = "https://github.com/navistau/eavesdrop"
+authors = ["Joshua Hogendorn <jhogendorn@gmail.com>"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
