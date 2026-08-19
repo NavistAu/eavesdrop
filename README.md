@@ -34,19 +34,12 @@ every message when the window resizes. Piped, or with `--json` or
 ## Requirements
 
 - Rust 1.95 or later, to build from source.
-- A Linux (x86_64 or aarch64) or macOS (aarch64) machine, for a release binary.
 - Claude Code 2.1.224 or later — the version that added `SendMessage` and
   `ListAgents`.
 
 ## Install
 
-### From a release binary
-
-Download the archive for your platform from the
-[latest release](https://github.com/navistau/eavesdrop/releases/latest),
-extract it, and put `eavesdrop` on your `PATH`.
-
-### From source
+Clone the repo and build from source:
 
 ```sh
 mise run release
@@ -58,9 +51,6 @@ post-build hook — `build.rs` runs before the binary is linked.
 
 Needs Rust 1.95 (`mise install` picks it up from `mise.toml`).
 
-Building from source gets you the current `develop` tip's behaviour; a
-release binary is pinned to a tagged version. Prefer source if you're
-tracking a fix that hasn't shipped yet.
 
 ## Use
 
